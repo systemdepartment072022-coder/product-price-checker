@@ -9,7 +9,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "worker:dev": "wrangler dev",
-    "d1:migrate": "wrangler d1 migrations apply product-price-db",
+    "d1:migrate": "wrangler d1 migrations apply product-price-checker-db",
     "deploy": "npm run build && wrangler deploy"
   },
   "dependencies": {

@@ -2,13 +2,12 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Calculator, Check, ChevronRight, Download, Edit3, History, Package,
-  Plus, Printer, RefreshCcw, Search, Upload, X, Power, Boxes,
+  Plus, Printer, RefreshCcw, Search, Upload, X, Power, Boxes, Tags,
 } from 'lucide-react'
 
 type Product = {
   id: number
   item_code: string
-  barcode?: string
   item_description: string
   grammage?: string
   pack_size?: string | number
@@ -42,6 +41,13 @@ const php = new Intl.NumberFormat('en-PH', {
 })
 
 const money = (pesos?: number) => php.format(pesos || 0)
+
+const perPiecePrice = (casePrice: string, packSize: number) => {
+  const price = Number(casePrice || 0)
+  if (!Number.isFinite(price) || packSize <= 0) return '0.00'
+  const caseCents = Math.round(price * 100 + Number.EPSILON)
+  return (Math.round(caseCents / packSize) / 100).toFixed(2)
+}
 
 const api = async (path: string, options?: RequestInit) => {
   const response = await fetch(path, {
@@ -79,14 +85,12 @@ function highlight(text: string, query: string) {
 
 const emptyForm = {
   item_code: '',
-  barcode: '',
   item_description: '',
   grammage: '',
   pack_size: '',
   brand: '',
   category: '',
   lpbt_price_case: '',
-  lpbt_price_pcs: '',
   effective_date: new Date().toISOString().slice(0, 10),
   remarks: '',
 }
@@ -103,8 +107,8 @@ function CalculatorPanel({ product }: { product: Product }) {
   const n = (x: string) => Math.max(0, Number(x || 0))
   const percent = Math.min(100, n(discount))
 
-  const caseBase = product.lpat_price_case || 0
-  const pcsBase = product.lpat_price_pcs || 0
+  const caseBase = product.lpbt_price_case || 0
+  const pcsBase = product.lpbt_price_pcs || 0
 
   const caseNet = Math.max(0, caseBase * (1 - percent / 100))
   const pcsNet = Math.max(0, pcsBase * (1 - percent / 100))
@@ -192,11 +196,11 @@ Savings: ${money(Math.max(0, original - grand))}`
 
       <div className="result-grid">
         <div>
-          <span>LPAT case</span>
+          <span>LPBT case</span>
           <strong>{money(caseBase)}</strong>
         </div>
         <div>
-          <span>LPAT pcs</span>
+          <span>LPBT pcs</span>
           <strong>{money(pcsBase)}</strong>
         </div>
         <div>
@@ -300,7 +304,7 @@ function SearchPage() {
       <div className="search-hero">
         <span className="eyebrow">Quick lookup</span>
         <h1>Find product prices</h1>
-        <p>Search by item code, barcode, description, brand or category.</p>
+        <p>Search by item code, description, brand or category.</p>
 
         <div className="search-wrap">
           <Search size={22} />
@@ -373,7 +377,6 @@ function SearchPage() {
             <div className="detail-grid">
               {[
                 ['Item code', selected.item_code],
-                ['Barcode', selected.barcode || '—'],
                 ['Grammage', selected.grammage || '—'],
                 ['Pack size', selected.pack_size || '—'],
                 ['Brand', selected.brand || '—'],
@@ -427,10 +430,14 @@ function SearchPage() {
 
 function ProductForm({
   product,
+  brands,
+  categories,
   onClose,
   onSaved,
 }: {
   product?: Product | null
+  brands: string[]
+  categories: string[]
   onClose: () => void
   onSaved: () => void
 }) {
@@ -438,14 +445,12 @@ function ProductForm({
     product
       ? {
           item_code: product.item_code || '',
-          barcode: product.barcode || '',
           item_description: product.item_description || '',
           grammage: product.grammage || '',
           pack_size: String(product.pack_size || ''),
           brand: product.brand || '',
           category: product.category || '',
           lpbt_price_case: '',
-          lpbt_price_pcs: '',
           effective_date: new Date().toISOString().slice(0, 10),
           remarks: product.remarks || '',
         }
@@ -459,24 +464,25 @@ function ProductForm({
     setForm((old) => ({ ...old, [key]: value }))
   }
 
+  const packSize = Number(form.pack_size)
+  const lpbtPcs = perPiecePrice(form.lpbt_price_case, packSize)
   const lpatCase = (Number(form.lpbt_price_case || 0) * 1.12).toFixed(2)
-  const lpatPcs = (Number(form.lpbt_price_pcs || 0) * 1.12).toFixed(2)
+  const lpatPcs = (Number(lpbtPcs) * 1.12).toFixed(2)
 
   const submit = async () => {
     setError('')
 
-    if (!form.item_code.trim() || !form.item_description.trim()) {
-      setError('Item code and item description are required.')
+    if (!form.item_code.trim() || !form.item_description.trim() || !Number.isInteger(packSize) || packSize <= 0) {
+      setError('Item code, item description, and a positive whole-number pack size are required.')
       return
     }
 
     if (!product && (
       form.lpbt_price_case === '' ||
-      form.lpbt_price_pcs === '' ||
-      Number(form.lpbt_price_case) < 0 ||
-      Number(form.lpbt_price_pcs) < 0
+      !Number.isFinite(Number(form.lpbt_price_case)) ||
+      Number(form.lpbt_price_case) < 0
     )) {
-      setError('Please enter valid LPBT case and pcs prices.')
+      setError('Please enter a valid LPBT case price.')
       return
     }
 
@@ -527,12 +533,8 @@ function ProductForm({
         <div className="form-grid">
           {([
             { key: 'item_code', label: 'Item code', required: true },
-            { key: 'barcode', label: 'Barcode', required: false },
             { key: 'item_description', label: 'Item description', required: true },
             { key: 'grammage', label: 'Grammage', required: false },
-            { key: 'pack_size', label: 'Pack size', required: false },
-            { key: 'brand', label: 'Brand', required: false },
-            { key: 'category', label: 'Category', required: false },
             { key: 'remarks', label: 'Remarks', required: false },
           ] as const).map(({ key, label, required }) => (
             <label key={key}>
@@ -544,6 +546,33 @@ function ProductForm({
               />
             </label>
           ))}
+          <label>
+            Pack size (pcs per case)
+            <input
+              type="number"
+              min="1"
+              step="1"
+              required
+              value={form.pack_size}
+              onChange={(e) => set('pack_size', e.target.value)}
+            />
+          </label>
+          <label>
+            Brand
+            <select value={form.brand} onChange={(e) => set('brand', e.target.value)}>
+              <option value="">Select a brand</option>
+              {form.brand && !brands.includes(form.brand) && <option value={form.brand}>{form.brand}</option>}
+              {brands.map((brand) => <option key={brand} value={brand}>{brand}</option>)}
+            </select>
+          </label>
+          <label>
+            Category
+            <select value={form.category} onChange={(e) => set('category', e.target.value)}>
+              <option value="">Select a category</option>
+              {form.category && !categories.includes(form.category) && <option value={form.category}>{form.category}</option>}
+              {categories.map((category) => <option key={category} value={category}>{category}</option>)}
+            </select>
+          </label>
         </div>
 
         {!product && (
@@ -552,24 +581,13 @@ function ProductForm({
 
             <div className="form-grid">
               <label>
-                LPBT price case (₱)
+                LPBT price per case (₱)
                 <input
                   type="number"
                   min="0"
                   step="0.01"
                   value={form.lpbt_price_case}
                   onChange={(e) => set('lpbt_price_case', e.target.value)}
-                />
-              </label>
-
-              <label>
-                LPBT price pcs (₱)
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={form.lpbt_price_pcs}
-                  onChange={(e) => set('lpbt_price_pcs', e.target.value)}
                 />
               </label>
 
@@ -584,6 +602,10 @@ function ProductForm({
             </div>
 
             <div className="preview-prices">
+              <div>
+                <span>LPBT per piece (automatic)</span>
+                <strong>₱{lpbtPcs}</strong>
+              </div>
               <div>
                 <span>LPAT case</span>
                 <strong>₱{lpatCase}</strong>
@@ -625,7 +647,6 @@ function BatchModal({
 }) {
   const [form, setForm] = useState({
     lpbt_price_case: '',
-    lpbt_price_pcs: '',
     effective_date: new Date().toISOString().slice(0, 10),
     remarks: '',
   })
@@ -637,14 +658,21 @@ function BatchModal({
     setForm((old) => ({ ...old, [key]: value }))
   }
 
+  const packSize = Number(product.pack_size)
+  const lpbtPcs = perPiecePrice(form.lpbt_price_case, packSize)
+
   const submit = async () => {
     if (
       form.lpbt_price_case === '' ||
-      form.lpbt_price_pcs === '' ||
-      Number(form.lpbt_price_case) < 0 ||
-      Number(form.lpbt_price_pcs) < 0
+      !Number.isFinite(Number(form.lpbt_price_case)) ||
+      Number(form.lpbt_price_case) < 0
     ) {
-      setError('Please enter valid LPBT case and pcs prices.')
+      setError('Please enter a valid LPBT case price.')
+      return
+    }
+
+    if (!Number.isInteger(packSize) || packSize <= 0) {
+      setError('Set a positive whole-number pack size for this product before adding prices.')
       return
     }
 
@@ -669,7 +697,6 @@ function BatchModal({
             {
               product_id: product.id,
               lpbt_price_case: Number(form.lpbt_price_case),
-              lpbt_price_pcs: Number(form.lpbt_price_pcs),
             },
           ],
         }),
@@ -723,16 +750,6 @@ function BatchModal({
             />
           </label>
 
-          <label>
-            LPBT pcs (₱)
-            <input
-              type="number"
-              min="0"
-              step="0.01"
-              value={form.lpbt_price_pcs}
-              onChange={(e) => set('lpbt_price_pcs', e.target.value)}
-            />
-          </label>
         </div>
 
         <label>
@@ -745,6 +762,11 @@ function BatchModal({
 
         <div className="preview-prices">
           <div>
+            <span>LPBT pcs (automatic)</span>
+            <strong>₱{lpbtPcs}</strong>
+          </div>
+
+          <div>
             <span>LPAT case</span>
             <strong>
               ₱{(Number(form.lpbt_price_case || 0) * 1.12).toFixed(2)}
@@ -754,7 +776,7 @@ function BatchModal({
           <div>
             <span>LPAT pcs</span>
             <strong>
-              ₱{(Number(form.lpbt_price_pcs || 0) * 1.12).toFixed(2)}
+              ₱{(Number(lpbtPcs) * 1.12).toFixed(2)}
             </strong>
           </div>
         </div>
@@ -773,6 +795,114 @@ function BatchModal({
   )
 }
 
+function CatalogSection({
+  type,
+  values,
+  onChanged,
+}: {
+  type: 'brand' | 'category'
+  values: string[]
+  onChanged: () => Promise<void>
+}) {
+  const [value, setValue] = useState('')
+  const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const label = type === 'brand' ? 'Brand' : 'Category'
+
+  const add = async () => {
+    setError('')
+    setSaving(true)
+    try {
+      await api('/api/admin/lookups', {
+        method: 'POST',
+        body: JSON.stringify({ type, value }),
+      })
+      setValue('')
+      await onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Unable to add ${label.toLowerCase()}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const remove = async (item: string) => {
+    if (!window.confirm(`Remove ${label.toLowerCase()} "${item}"?`)) return
+    setError('')
+    try {
+      await api('/api/admin/lookups', {
+        method: 'DELETE',
+        body: JSON.stringify({ type, value: item }),
+      })
+      await onChanged()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : `Unable to remove ${label.toLowerCase()}`)
+    }
+  }
+
+  return (
+    <section className="catalog-section">
+      <h3>{label}s</h3>
+      <div className="catalog-add">
+        <input
+          aria-label={`New ${label.toLowerCase()}`}
+          value={value}
+          maxLength={100}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder={`Add ${label.toLowerCase()}`}
+        />
+        <button className="btn" onClick={add} disabled={saving || !value.trim()}>
+          <Plus size={16} /> Add
+        </button>
+      </div>
+      {error && <div className="error">{error}</div>}
+      <ul className="catalog-list">
+        {values.map((item) => (
+          <li key={item}>
+            <span>{item}</span>
+            <button type="button" onClick={() => remove(item)} aria-label={`Remove ${item}`}>
+              <X size={16} />
+            </button>
+          </li>
+        ))}
+        {!values.length && <li className="catalog-empty">No {label.toLowerCase()}s added.</li>}
+      </ul>
+    </section>
+  )
+}
+
+function CatalogManager({
+  brands,
+  categories,
+  onClose,
+  onChanged,
+}: {
+  brands: string[]
+  categories: string[]
+  onClose: () => void
+  onChanged: () => Promise<void>
+}) {
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">Product lists</span>
+            <h2>Manage brands and categories</h2>
+          </div>
+          <button onClick={onClose} aria-label="Close list maintenance">
+            <X />
+          </button>
+        </div>
+        <div className="catalog-grid">
+          <CatalogSection type="brand" values={brands} onChanged={onChanged} />
+          <CatalogSection type="category" values={categories} onChanged={onChanged} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // =====================================================
 // ADMIN PRODUCT MANAGEMENT
 // =====================================================
@@ -782,6 +912,8 @@ function AdminPage() {
   const [query, setQuery] = useState('')
   const [form, setForm] = useState<Product | 'new' | null>(null)
   const [batch, setBatch] = useState<Product | null>(null)
+  const [catalog, setCatalog] = useState<{ brands: string[]; categories: string[] }>({ brands: [], categories: [] })
+  const [manageCatalog, setManageCatalog] = useState(false)
 
   const [history, setHistory] = useState<{
     product: Product
@@ -790,6 +922,16 @@ function AdminPage() {
 
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [catalogError, setCatalogError] = useState('')
+
+  const loadCatalog = async () => {
+    const data = await api('/api/admin/lookups')
+    setCatalog({
+      brands: Array.isArray(data.brands) ? data.brands : [],
+      categories: Array.isArray(data.categories) ? data.categories : [],
+    })
+    setCatalogError('')
+  }
 
   const load = async () => {
     setLoading(true)
@@ -810,6 +952,12 @@ function AdminPage() {
 
   useEffect(() => {
     load()
+  }, [])
+
+  useEffect(() => {
+    loadCatalog().catch((e) => {
+      setCatalogError(e instanceof Error ? e.message : 'Unable to load brand and category lists')
+    })
   }, [])
 
   useEffect(() => {
@@ -920,6 +1068,10 @@ function AdminPage() {
         </div>
 
         <div className="actions">
+          <button className="btn secondary" onClick={() => setManageCatalog(true)}>
+            <Tags size={17} /> Manage lists
+          </button>
+
           <label className="btn secondary upload">
             <Upload size={17} /> Import
 
@@ -960,6 +1112,7 @@ function AdminPage() {
       </div>
 
       {error && <div className="error">{error}</div>}
+      {catalogError && <div className="error">{catalogError}</div>}
 
       <div className="table-wrap">
         <table>
@@ -1066,11 +1219,22 @@ function AdminPage() {
       {(form === 'new' || form) && (
         <ProductForm
           product={form === 'new' ? null : form}
+          brands={catalog.brands}
+          categories={catalog.categories}
           onClose={() => setForm(null)}
           onSaved={() => {
             setForm(null)
             load()
           }}
+        />
+      )}
+
+      {manageCatalog && (
+        <CatalogManager
+          brands={catalog.brands}
+          categories={catalog.categories}
+          onClose={() => setManageCatalog(false)}
+          onChanged={loadCatalog}
         />
       )}
 

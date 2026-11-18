@@ -1,2 +1,2 @@
-item_code,barcode,item_description,grammage,pack_size,brand,category,lpbt_price_case,lpbt_price_pcs,batch_id,effective_date,remarks
-SAMPLE-001,480000000001,SAMPLE PRODUCT,500ml,12,SAMPLE BRAND,BEVERAGES,1200.00,125.00,BATCH-001,2026-11-18,Initial import
+item_code,item_description,grammage,pack_size,brand,category,lpbt_price_case,effective_date,remarks
+SAMPLE-001,SAMPLE PRODUCT,500ml,12,SAMPLE BRAND,BEVERAGES,1200.00,2026-11-18,Initial import
