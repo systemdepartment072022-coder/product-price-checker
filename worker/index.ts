@@ -1,296 +1,532 @@
 export interface Env {
-  DB: D1Database
-  ASSETS: Fetcher
-  DEV_MODE?: string
-  ADMIN_EMAILS?: string
+  DB: D1Database;
+  ASSETS: Fetcher;
+  DEV_MODE?: string;
+  ADMIN_EMAILS?: string;
 }
+
+type ProductInput = {
+  item_code?: unknown;
+  barcode?: unknown;
+  item_description?: unknown;
+  description?: unknown;
+  grammage?: unknown;
+  pack_size?: unknown;
+  brand?: unknown;
+  category?: unknown;
+  remarks?: unknown;
+  lpbt_price_case?: unknown;
+  lpbt_price_pcs?: unknown;
+  effective_date?: unknown;
+};
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
-  })
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
 
-const cents = (value: unknown) => {
-  if (typeof value === 'number') return Math.round(value * 100)
-  const text = String(value ?? '').trim()
-  if (!/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error(`Invalid monetary value: ${text}`)
-  const [whole, fraction = ''] = text.split('.')
-  return Number(whole) * 100 + Number(fraction.padEnd(2, '0'))
+const clean = (value: unknown) =>
+  typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
+
+function toCents(value: unknown): number {
+  const text = clean(value);
+  if (text === "") return 0;
+  if (!/^\d+(?:\.\d{1,2})?$/.test(text)) {
+    throw new Error(`Invalid monetary value: ${text}`);
+  }
+  const [whole, fraction = ""] = text.split(".");
+  const amount = Number(whole) * 100 + Number(fraction.padEnd(2, "0"));
+  if (!Number.isSafeInteger(amount)) throw new Error("Monetary value is too large");
+  return amount;
 }
 
-const lpat = (lpbt: number) => Math.round((lpbt * 112) / 100)
-const clean = (value: unknown) => typeof value === 'string' ? value.trim() : ''
+const toPesos = (cents: number | null | undefined) =>
+  cents == null ? null : cents / 100;
 
-function getUser(request: Request, env: Env) {
-  if (env.DEV_MODE === 'true') return 'development-admin'
-  const email = request.headers.get('CF-Access-Authenticated-User-Email')
-  const allowed = (env.ADMIN_EMAILS || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean)
-  if (!email || (allowed.length && !allowed.includes(email.toLowerCase()))) return null
-  return email
+const lpatCents = (lpbtCents: number) => Math.round((lpbtCents * 112) / 100);
+
+function getAdmin(request: Request, env: Env): string | null {
+  // DEV_MODE must never be enabled on the public production Worker.
+  if (env.DEV_MODE === "true") return "development-admin";
+
+  const email = request.headers.get("cf-access-authenticated-user-email");
+  const allowed = (env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!email) return null;
+  if (allowed.length > 0 && !allowed.includes(email.toLowerCase())) return null;
+  return email;
 }
 
-function requireAdmin(request: Request, env: Env) {
-  const user = getUser(request, env)
-  if (!user) throw Object.assign(new Error('Administrator access required'), { status: 403 })
-  return user
+function requireAdmin(request: Request, env: Env): string {
+  const user = getAdmin(request, env);
+  if (!user) throw Object.assign(new Error("Administrator access required"), { status: 403 });
+  return user;
 }
 
-async function currentProduct(db: D1Database, id: number) {
-  return db.prepare(`
-    SELECT p.*, b.id AS batch_db_id, b.batch_id, b.lpbt_price_case, b.lpbt_price_pcs,
-      b.lpat_price_case, b.lpat_price_pcs, b.effective_date, b.expiration_date,
-      b.remarks AS batch_remarks
+function productWithPrice(row: Record<string, any> | null) {
+  if (!row) return null;
+  return {
+    ...row,
+    item_description: row.description,
+    batch_id: row.batch_code ?? null,
+    lpbt_price_case: toPesos(row.lpbt_case_cents),
+    lpbt_price_pcs: toPesos(row.lpbt_pcs_cents),
+    lpat_price_case: toPesos(row.lpat_case_cents),
+    lpat_price_pcs: toPesos(row.lpat_pcs_cents),
+  };
+}
+
+async function getCurrentProduct(db: D1Database, id: number) {
+  const row = await db.prepare(`
+    SELECT p.*,
+      pb.batch_code, pb.effective_date,
+      pbi.lpbt_case_cents, pbi.lpbt_pcs_cents,
+      pbi.lpat_case_cents, pbi.lpat_pcs_cents,
+      pbi.id AS price_record_id
     FROM products p
-    LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
+    LEFT JOIN price_batch_items pbi
+      ON pbi.product_id = p.id AND pbi.is_current = 1
+    LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
     WHERE p.id = ?
-  `).bind(id).first()
+  `).bind(id).first<Record<string, any>>();
+  return productWithPrice(row);
+}
+
+async function logActivity(
+  db: D1Database,
+  admin: string,
+  action: string,
+  entityType: string,
+  entityId: number | null,
+  details: unknown,
+) {
+  await db.prepare(`
+    INSERT INTO activity_logs (admin_email, action, entity_type, entity_id, details)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(admin, action, entityType, entityId, JSON.stringify(details ?? {})).run();
+}
+
+function makeBatchCode() {
+  const date = new Date().toISOString().slice(0, 10).replaceAll("-", "");
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase();
+  return `BATCH-${date}-${suffix}`;
+}
+
+async function createBatch(
+  db: D1Database,
+  admin: string,
+  effectiveDate: string,
+  items: Array<{ productId: number; caseCents: number; pcsCents: number }>,
+  notes = "",
+) {
+  if (!effectiveDate) throw new Error("Effective date is required");
+  if (!Array.isArray(items) || items.length === 0) throw new Error("At least one product is required");
+
+  const batchCode = makeBatchCode();
+  const batchInsert = await db.prepare(`
+    INSERT INTO price_batches (batch_code, batch_name, effective_date, notes, created_by)
+    VALUES (?, ?, ?, ?, ?)
+  `).bind(batchCode, batchCode, effectiveDate, notes || null, admin).run();
+
+  const batchId = Number(batchInsert.meta.last_row_id);
+  const statements: D1PreparedStatement[] = [];
+
+  for (const item of items) {
+    statements.push(
+      db.prepare(`
+        UPDATE price_batch_items
+        SET is_current = 0
+        WHERE product_id = ? AND is_current = 1
+      `).bind(item.productId),
+    );
+    statements.push(
+      db.prepare(`
+        INSERT INTO price_batch_items
+          (batch_id, product_id, lpbt_case_cents, lpbt_pcs_cents,
+           lpat_case_cents, lpat_pcs_cents, is_current)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+      `).bind(
+        batchId,
+        item.productId,
+        item.caseCents,
+        item.pcsCents,
+        lpatCents(item.caseCents),
+        lpatCents(item.pcsCents),
+      ),
+    );
+    statements.push(
+      db.prepare(`
+        UPDATE products SET updated_at = datetime('now') WHERE id = ?
+      `).bind(item.productId),
+    );
+  }
+
+  statements.push(
+    db.prepare(`
+      INSERT INTO activity_logs (admin_email, action, entity_type, entity_id, details)
+      VALUES (?, 'price_batch_created', 'price_batch', ?, ?)
+    `).bind(admin, batchId, JSON.stringify({ batch_code: batchCode, item_count: items.length })),
+  );
+
+  await db.batch(statements);
+  return { id: batchId, batch_code: batchCode, effective_date: effectiveDate, item_count: items.length };
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url)
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
     try {
-      if (url.pathname.startsWith('/api/')) {
-        const path = url.pathname
-        const method = request.method
+      if (!path.startsWith("/api/")) return env.ASSETS.fetch(request);
 
-        if (method === 'GET' && path === '/api/products/search') {
-          const q = clean(url.searchParams.get('q'))
-          const page = Math.max(1, Number(url.searchParams.get('page') || 1))
-          const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') || 12)))
-          const offset = (page - 1) * limit
-          if (!q) return json({ items: [], total: 0, page, limit })
-          const term = `%${q.toLowerCase()}%`
-          const count = await env.DB.prepare(`
-            SELECT COUNT(*) AS count FROM products p
-            WHERE p.is_active = 1 AND (
-              LOWER(p.item_code) LIKE ? OR LOWER(COALESCE(p.barcode,'')) LIKE ? OR
-              LOWER(p.item_description) LIKE ? OR LOWER(COALESCE(p.grammage,'')) LIKE ? OR
-              CAST(p.pack_size AS TEXT) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ? OR
-              LOWER(COALESCE(p.category,'')) LIKE ?
-            )`).bind(term, term, term, term, term, term, term).first<{ count: number }>()
-          const { results } = await env.DB.prepare(`
-            SELECT p.*, b.batch_id, b.lpbt_price_case, b.lpbt_price_pcs,
-              b.lpat_price_case, b.lpat_price_pcs, b.effective_date, b.expiration_date
-            FROM products p
-            LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
-            WHERE p.is_active = 1 AND (
-              LOWER(p.item_code) LIKE ? OR LOWER(COALESCE(p.barcode,'')) LIKE ? OR
-              LOWER(p.item_description) LIKE ? OR LOWER(COALESCE(p.grammage,'')) LIKE ? OR
-              CAST(p.pack_size AS TEXT) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ? OR
-              LOWER(COALESCE(p.category,'')) LIKE ?
-            )
-            ORDER BY p.item_description ASC LIMIT ? OFFSET ?
-          `).bind(term, term, term, term, term, term, term, limit, offset).all()
-          return json({ items: results, total: count?.count || 0, page, limit })
-        }
+      // PUBLIC: search active products only.
+      if (method === "GET" && path === "/api/products/search") {
+        const q = clean(url.searchParams.get("q")).toLowerCase();
+        const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+        const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 12)));
+        const offset = (page - 1) * limit;
+        if (!q) return json({ items: [], total: 0, page, limit });
 
-        const idMatch = path.match(/^\/api\/products\/(\d+)$/)
-        if (method === 'GET' && idMatch) {
-          const product = await currentProduct(env.DB, Number(idMatch[1]))
-          if (!product) return json({ error: 'Product not found' }, 404)
-          return json(product)
-        }
+        const term = `%${q}%`;
+        const where = `
+          p.is_active = 1 AND (
+            LOWER(p.item_code) LIKE ? OR
+            LOWER(COALESCE(p.barcode, '')) LIKE ? OR
+            LOWER(p.description) LIKE ? OR
+            LOWER(COALESCE(p.grammage, '')) LIKE ? OR
+            LOWER(COALESCE(p.pack_size, '')) LIKE ? OR
+            LOWER(COALESCE(p.brand, '')) LIKE ? OR
+            LOWER(COALESCE(p.category, '')) LIKE ?
+          )
+        `;
+        const count = await env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM products p WHERE ${where}`,
+        ).bind(term, term, term, term, term, term, term).first<{ count: number }>();
 
-        const batchMatch = path.match(/^\/api\/products\/(\d+)\/(?:batches|history)$/)
-        if (method === 'GET' && batchMatch) {
-          const { results } = await env.DB.prepare(`
-            SELECT pb.*, p.item_code, p.item_description
-            FROM price_batches pb JOIN products p ON p.id = pb.product_id
-            WHERE pb.product_id = ? ORDER BY pb.effective_date DESC, pb.id DESC
-          `).bind(Number(batchMatch[1])).all()
-          return json(results)
-        }
+        const result = await env.DB.prepare(`
+          SELECT p.*, pb.batch_code, pb.effective_date,
+            pbi.lpbt_case_cents, pbi.lpbt_pcs_cents,
+            pbi.lpat_case_cents, pbi.lpat_pcs_cents
+          FROM products p
+          LEFT JOIN price_batch_items pbi
+            ON pbi.product_id = p.id AND pbi.is_current = 1
+          LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
+          WHERE ${where}
+          ORDER BY p.description COLLATE NOCASE
+          LIMIT ? OFFSET ?
+        `).bind(term, term, term, term, term, term, term, limit, offset).all<Record<string, any>>();
 
-        if (method === 'GET' && path === '/api/admin/products') {
-          requireAdmin(request, env)
-          const q = clean(url.searchParams.get('q')).toLowerCase()
-          const page = Math.max(1, Number(url.searchParams.get('page') || 1))
-          const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') || 20)))
-          const offset = (page - 1) * limit
-          const term = `%${q}%`
-          const count = await env.DB.prepare(`
-            SELECT COUNT(*) count FROM products p
-            WHERE ? = '' OR LOWER(p.item_code) LIKE ? OR LOWER(COALESCE(p.barcode,'')) LIKE ? OR
-              LOWER(p.item_description) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ?
-          `).bind(q, term, term, term, term).first<{ count: number }>()
-          const { results } = await env.DB.prepare(`
-            SELECT p.*, b.batch_id, b.lpbt_price_case, b.lpbt_price_pcs,
-              b.lpat_price_case, b.lpat_price_pcs, b.effective_date
-            FROM products p LEFT JOIN price_batches b ON b.product_id=p.id AND b.is_current=1
-            WHERE ? = '' OR LOWER(p.item_code) LIKE ? OR LOWER(COALESCE(p.barcode,'')) LIKE ? OR
-              LOWER(p.item_description) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ?
-            ORDER BY p.date_updated DESC LIMIT ? OFFSET ?
-          `).bind(q, term, term, term, term, limit, offset).all()
-          return json({ items: results, total: count?.count || 0, page, limit })
-        }
-
-        if (method === 'POST' && path === '/api/products') {
-          const user = requireAdmin(request, env)
-          const body = await request.json() as Record<string, unknown>
-          const itemCode = clean(body.item_code)
-          const description = clean(body.item_description)
-          if (!itemCode || !description) return json({ error: 'Item code and item description are required' }, 400)
-          if (body.barcode !== undefined && body.barcode !== null && !/^\d*$/.test(clean(body.barcode))) {
-            return json({ error: 'Barcode must contain numbers only' }, 400)
-          }
-          const casePrice = cents(body.lpbt_price_case)
-          const pcsPrice = cents(body.lpbt_price_pcs)
-          if (casePrice < 0 || pcsPrice < 0) return json({ error: 'Prices cannot be negative' }, 400)
-          const batchId = clean(body.batch_id) || `BATCH-${Date.now()}`
-          const effectiveDate = clean(body.effective_date)
-          if (!effectiveDate) return json({ error: 'Effective date is required' }, 400)
-
-          const duplicate = await env.DB.prepare(
-            'SELECT id FROM products WHERE item_code=? OR (barcode IS NOT NULL AND barcode=?)'
-          ).bind(itemCode, clean(body.barcode)).first()
-          if (duplicate) return json({ error: 'A product already exists with this item code or barcode' }, 409)
-
-          const created = await env.DB.prepare(`
-            INSERT INTO products (item_code,barcode,item_description,grammage,pack_size,brand,category,remarks)
-            VALUES (?,?,?,?,?,?,?,?)
-          `).bind(itemCode, clean(body.barcode) || null, description, clean(body.grammage) || null,
-            body.pack_size ? Number(body.pack_size) : null, clean(body.brand) || null,
-            clean(body.category) || null, clean(body.remarks) || null).run()
-          const productId = created.meta.last_row_id as number
-          await env.DB.prepare(`
-            INSERT INTO price_batches
-              (product_id,batch_id,lpbt_price_case,lpbt_price_pcs,lpat_price_case,lpat_price_pcs,effective_date,is_current,remarks,created_by)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-          `).bind(productId, batchId, casePrice, pcsPrice, lpat(casePrice), lpat(pcsPrice),
-            effectiveDate, 1, clean(body.remarks) || null, user).run()
-          await env.DB.prepare(
-            'INSERT INTO activity_logs (product_id,action,previous_value,new_value,modified_by) VALUES (?,?,?,?,?)'
-          ).bind(productId, 'product_created', null, JSON.stringify(body), user).run()
-          return json(await currentProduct(env.DB, productId), 201)
-        }
-
-        if (method === 'PUT' && idMatch) {
-          const user = requireAdmin(request, env)
-          const body = await request.json() as Record<string, unknown>
-          const id = Number(idMatch[1])
-          if (body.barcode !== undefined && body.barcode !== null && !/^\d*$/.test(clean(body.barcode))) {
-            return json({ error: 'Barcode must contain numbers only' }, 400)
-          }
-          await env.DB.prepare(`
-            UPDATE products SET item_code=?,barcode=?,item_description=?,grammage=?,pack_size=?,
-              brand=?,category=?,remarks=?,date_updated=strftime('%Y-%m-%dT%H:%M:%SZ','now')
-            WHERE id=?
-          `).bind(clean(body.item_code), clean(body.barcode) || null, clean(body.item_description),
-            clean(body.grammage) || null, body.pack_size ? Number(body.pack_size) : null,
-            clean(body.brand) || null, clean(body.category) || null, clean(body.remarks) || null, id).run()
-          await env.DB.prepare(
-            'INSERT INTO activity_logs (product_id,action,new_value,modified_by) VALUES (?,?,?,?)'
-          ).bind(id, 'product_updated', JSON.stringify(body), user).run()
-          return json(await currentProduct(env.DB, id))
-        }
-
-        const statusMatch = path.match(/^\/api\/products\/(\d+)\/status$/)
-        if (method === 'PATCH' && statusMatch) {
-          const user = requireAdmin(request, env)
-          const body = await request.json() as { is_active: boolean }
-          const id = Number(statusMatch[1])
-          await env.DB.prepare(
-            "UPDATE products SET is_active=?,date_updated=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?"
-          ).bind(body.is_active ? 1 : 0, id).run()
-          await env.DB.prepare(
-            'INSERT INTO activity_logs (product_id,action,new_value,modified_by) VALUES (?,?,?,?)'
-          ).bind(id, 'status_changed', body.is_active ? 'active' : 'inactive', user).run()
-          return json(await currentProduct(env.DB, id))
-        }
-
-        if (method === 'POST' && batchMatch) {
-          const user = requireAdmin(request, env)
-          const id = Number(batchMatch[1])
-          const body = await request.json() as Record<string, unknown>
-          const batchId = clean(body.batch_id)
-          const effectiveDate = clean(body.effective_date)
-          if (!batchId || !effectiveDate) return json({ error: 'Batch ID and effective date are required' }, 400)
-          const casePrice = cents(body.lpbt_price_case)
-          const pcsPrice = cents(body.lpbt_price_pcs)
-          await env.DB.batch([
-            env.DB.prepare('UPDATE price_batches SET is_current=0, expiration_date=CASE WHEN expiration_date IS NULL THEN ? ELSE expiration_date END WHERE product_id=? AND is_current=1').bind(effectiveDate, id),
-            env.DB.prepare(`
-              INSERT INTO price_batches
-              (product_id,batch_id,lpbt_price_case,lpbt_price_pcs,lpat_price_case,lpat_price_pcs,effective_date,is_current,remarks,created_by)
-              VALUES (?,?,?,?,?,?,?,?,?,?)
-            `).bind(id, batchId, casePrice, pcsPrice, lpat(casePrice), lpat(pcsPrice), effectiveDate, 1, clean(body.remarks) || null, user),
-            env.DB.prepare("UPDATE products SET date_updated=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?").bind(id),
-            env.DB.prepare('INSERT INTO activity_logs (product_id,batch_id,action,new_value,modified_by) VALUES (?,?,?,?,?)').bind(id, batchId, 'batch_created', JSON.stringify(body), user),
-          ])
-          return json(await currentProduct(env.DB, id), 201)
-        }
-
-        if (method === 'POST' && path === '/api/admin/import') {
-          requireAdmin(request, env)
-          const body = await request.json() as { rows?: Record<string, unknown>[] }
-          if (!Array.isArray(body.rows)) return json({ error: 'CSV rows are required' }, 400)
-          const summary = { imported: 0, skipped: 0, errors: [] as string[] }
-          for (let i = 0; i < body.rows.length; i++) {
-            const row = body.rows[i]
-            try {
-              const itemCode = clean(row.item_code)
-              const description = clean(row.item_description)
-              if (!itemCode || !description) throw new Error('Item code and item description are required')
-              const barcode = clean(row.barcode)
-              if (barcode && !/^\d+$/.test(barcode)) throw new Error('Barcode must contain numbers only')
-              const casePrice = cents(row.lpbt_price_case)
-              const pcsPrice = cents(row.lpbt_price_pcs)
-              let product = await env.DB.prepare('SELECT id FROM products WHERE item_code=? OR (barcode IS NOT NULL AND barcode=?)')
-                .bind(itemCode, barcode).first<{ id: number }>()
-              if (!product) {
-                const created = await env.DB.prepare(`
-                  INSERT INTO products (item_code,barcode,item_description,grammage,pack_size,brand,category,remarks)
-                  VALUES (?,?,?,?,?,?,?,?)
-                `).bind(itemCode, barcode || null, description, clean(row.grammage) || null,
-                  row.pack_size ? Number(row.pack_size) : null, clean(row.brand) || null,
-                  clean(row.category) || null, clean(row.remarks) || null).run()
-                product = { id: created.meta.last_row_id as number }
-              }
-              const batchId = clean(row.batch_id) || `IMPORT-${Date.now()}-${i}`
-              await env.DB.prepare('UPDATE price_batches SET is_current=0 WHERE product_id=? AND is_current=1').bind(product.id).run()
-              await env.DB.prepare(`
-                INSERT INTO price_batches
-                  (product_id,batch_id,lpbt_price_case,lpbt_price_pcs,lpat_price_case,lpat_price_pcs,effective_date,is_current,remarks)
-                VALUES (?,?,?,?,?,?,?,?,?)
-              `).bind(product.id, batchId, casePrice, pcsPrice, lpat(casePrice), lpat(pcsPrice),
-                clean(row.effective_date) || new Date().toISOString().slice(0, 10), 1, clean(row.remarks) || null).run()
-              summary.imported++
-            } catch (error) {
-              summary.skipped++
-              summary.errors.push(`Row ${i + 2}: ${error instanceof Error ? error.message : 'Invalid row'}`)
-            }
-          }
-          return json(summary)
-        }
-
-        if (method === 'GET' && path === '/api/admin/export') {
-          requireAdmin(request, env)
-          const includeInactive = url.searchParams.get('inactive') === 'true'
-          let query = `
-            SELECT p.*, b.batch_id,b.lpbt_price_case,b.lpbt_price_pcs,b.lpat_price_case,b.lpat_price_pcs,
-              b.effective_date,b.expiration_date,b.is_current,b.remarks AS batch_remarks
-            FROM products p LEFT JOIN price_batches b ON b.product_id=p.id
-          `
-          if (!includeInactive) query += ' WHERE p.is_active=1'
-          query += ' ORDER BY p.item_code,b.effective_date DESC,b.id DESC'
-          const { results } = await env.DB.prepare(query).all()
-          const escape = (value: unknown) => {
-            const text = value == null ? '' : String(value)
-            return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
-          }
-          const headers = ['item_code','barcode','item_description','grammage','pack_size','brand','category','is_active',
-            'batch_id','lpbt_price_case','lpbt_price_pcs','lpat_price_case','lpat_price_pcs','effective_date','expiration_date','is_current']
-          const rows = (results || []).map((row: Record<string, unknown>) => headers.map((key) => escape(row[key])).join(','))
-          const csv = [headers.join(','), ...rows].join('\n')
-          return new Response(csv, { headers: { 'content-type': 'text/csv; charset=utf-8', 'content-disposition': 'attachment; filename="products.csv"' } })
-        }
+        return json({
+          items: (result.results || []).map(productWithPrice),
+          total: count?.count || 0,
+          page,
+          limit,
+        });
       }
-      return env.ASSETS.fetch(request)
+
+      const productIdMatch = path.match(/^\/api\/products\/(\d+)$/);
+      if (method === "GET" && productIdMatch) {
+        const product = await getCurrentProduct(env.DB, Number(productIdMatch[1]));
+        return product ? json(product) : json({ error: "Product not found" }, 404);
+      }
+
+      const historyMatch = path.match(/^\/api\/products\/(\d+)\/(?:batches|history)$/);
+      if (method === "GET" && historyMatch) {
+        const productId = Number(historyMatch[1]);
+        const result = await env.DB.prepare(`
+          SELECT pb.id AS batch_db_id, pb.batch_code AS batch_id,
+            pb.effective_date, pb.notes, pb.created_by, pb.created_at,
+            pbi.lpbt_case_cents, pbi.lpbt_pcs_cents,
+            pbi.lpat_case_cents, pbi.lpat_pcs_cents, pbi.is_current
+          FROM price_batch_items pbi
+          JOIN price_batches pb ON pb.id = pbi.batch_id
+          WHERE pbi.product_id = ?
+          ORDER BY pb.effective_date DESC, pb.id DESC
+        `).bind(productId).all<Record<string, any>>();
+
+        return json((result.results || []).map((row) => ({
+          ...row,
+          lpbt_price_case: toPesos(row.lpbt_case_cents),
+          lpbt_price_pcs: toPesos(row.lpbt_pcs_cents),
+          lpat_price_case: toPesos(row.lpat_case_cents),
+          lpat_price_pcs: toPesos(row.lpat_pcs_cents),
+        })));
+      }
+
+      // ADMIN: product listing.
+      if (method === "GET" && path === "/api/admin/products") {
+        requireAdmin(request, env);
+        const q = clean(url.searchParams.get("q")).toLowerCase();
+        const page = Math.max(1, Number(url.searchParams.get("page") || 1));
+        const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)));
+        const offset = (page - 1) * limit;
+        const term = `%${q}%`;
+        const where = q
+          ? `(LOWER(p.item_code) LIKE ? OR LOWER(COALESCE(p.barcode,'')) LIKE ?
+              OR LOWER(p.description) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ?)`
+          : "1=1";
+        const binds = q ? [term, term, term, term] : [];
+        const count = await env.DB.prepare(
+          `SELECT COUNT(*) AS count FROM products p WHERE ${where}`,
+        ).bind(...binds).first<{ count: number }>();
+        const result = await env.DB.prepare(`
+          SELECT p.*, pb.batch_code, pb.effective_date,
+            pbi.lpbt_case_cents, pbi.lpbt_pcs_cents,
+            pbi.lpat_case_cents, pbi.lpat_pcs_cents
+          FROM products p
+          LEFT JOIN price_batch_items pbi
+            ON pbi.product_id = p.id AND pbi.is_current = 1
+          LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
+          WHERE ${where}
+          ORDER BY p.updated_at DESC
+          LIMIT ? OFFSET ?
+        `).bind(...binds, limit, offset).all<Record<string, any>>();
+        return json({
+          items: (result.results || []).map(productWithPrice),
+          total: count?.count || 0,
+          page,
+          limit,
+        });
+      }
+
+      // ADMIN: add a product. Prices are optional; if supplied, a first batch is created.
+      if (method === "POST" && path === "/api/products") {
+        const admin = requireAdmin(request, env);
+        const body = await request.json() as ProductInput;
+        const itemCode = clean(body.item_code);
+        const description = clean(body.item_description ?? body.description);
+        const barcode = clean(body.barcode);
+        if (!itemCode || !description) {
+          return json({ error: "Item code and item description are required" }, 400);
+        }
+        if (barcode && !/^\d+$/.test(barcode)) {
+          return json({ error: "Barcode must contain numbers only" }, 400);
+        }
+
+        const duplicate = await env.DB.prepare(`
+          SELECT id FROM products
+          WHERE item_code = ? OR (? <> '' AND barcode = ?)
+        `).bind(itemCode, barcode, barcode).first();
+        if (duplicate) return json({ error: "A product already exists with this item code or barcode" }, 409);
+
+        const created = await env.DB.prepare(`
+          INSERT INTO products (item_code, barcode, description, grammage, pack_size, brand, category)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          itemCode,
+          barcode || null,
+          description,
+          clean(body.grammage) || null,
+          clean(body.pack_size) || null,
+          clean(body.brand) || null,
+          clean(body.category) || null,
+        ).run();
+
+        const productId = Number(created.meta.last_row_id);
+        await logActivity(env.DB, admin, "product_created", "product", productId, body);
+
+        const hasPrice = body.lpbt_price_case !== undefined || body.lpbt_price_pcs !== undefined;
+        if (hasPrice) {
+          const effectiveDate = clean(body.effective_date);
+          if (!effectiveDate) return json({ error: "Effective date is required when adding prices" }, 400);
+          const batch = await createBatch(env.DB, admin, effectiveDate, [{
+            productId,
+            caseCents: toCents(body.lpbt_price_case),
+            pcsCents: toCents(body.lpbt_price_pcs),
+          }]);
+          return json({ product: await getCurrentProduct(env.DB, productId), batch }, 201);
+        }
+        return json(await getCurrentProduct(env.DB, productId), 201);
+      }
+
+      // ADMIN: edit product details.
+      if (method === "PUT" && productIdMatch) {
+        const admin = requireAdmin(request, env);
+        const id = Number(productIdMatch[1]);
+        const body = await request.json() as ProductInput;
+        const itemCode = clean(body.item_code);
+        const description = clean(body.item_description ?? body.description);
+        const barcode = clean(body.barcode);
+        if (!itemCode || !description) {
+          return json({ error: "Item code and item description are required" }, 400);
+        }
+        if (barcode && !/^\d+$/.test(barcode)) {
+          return json({ error: "Barcode must contain numbers only" }, 400);
+        }
+        await env.DB.prepare(`
+          UPDATE products
+          SET item_code = ?, barcode = ?, description = ?, grammage = ?,
+              pack_size = ?, brand = ?, category = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).bind(
+          itemCode, barcode || null, description,
+          clean(body.grammage) || null, clean(body.pack_size) || null,
+          clean(body.brand) || null, clean(body.category) || null, id,
+        ).run();
+        await logActivity(env.DB, admin, "product_updated", "product", id, body);
+        return json(await getCurrentProduct(env.DB, id));
+      }
+
+      // ADMIN: activate/deactivate a product.
+      const statusMatch = path.match(/^\/api\/products\/(\d+)\/status$/);
+      if (method === "PATCH" && statusMatch) {
+        const admin = requireAdmin(request, env);
+        const id = Number(statusMatch[1]);
+        const body = await request.json() as { is_active?: boolean };
+        await env.DB.prepare(`
+          UPDATE products SET is_active = ?, updated_at = datetime('now') WHERE id = ?
+        `).bind(body.is_active ? 1 : 0, id).run();
+        await logActivity(env.DB, admin, "product_status_changed", "product", id, {
+          is_active: Boolean(body.is_active),
+        });
+        return json(await getCurrentProduct(env.DB, id));
+      }
+
+      // ADMIN: create one batch containing multiple products.
+      if (method === "POST" && path === "/api/admin/batches") {
+        const admin = requireAdmin(request, env);
+        const body = await request.json() as {
+          effective_date?: string;
+          notes?: string;
+          items?: Array<{ product_id: number; lpbt_price_case: unknown; lpbt_price_pcs: unknown }>;
+        };
+        const items = (body.items || []).map((item) => ({
+          productId: Number(item.product_id),
+          caseCents: toCents(item.lpbt_price_case),
+          pcsCents: toCents(item.lpbt_price_pcs),
+        }));
+        if (items.some((item) => !Number.isInteger(item.productId) || item.productId <= 0)) {
+          return json({ error: "Every batch item must have a valid product_id" }, 400);
+        }
+        const result = await createBatch(
+          env.DB, admin, clean(body.effective_date), items, clean(body.notes),
+        );
+        return json(result, 201);
+      }
+
+      // ADMIN: compatibility endpoint for adding a price batch to one product.
+      if (method === "POST" && historyMatch) {
+        const admin = requireAdmin(request, env);
+        const productId = Number(historyMatch[1]);
+        const body = await request.json() as {
+          effective_date?: string;
+          lpbt_price_case?: unknown;
+          lpbt_price_pcs?: unknown;
+          remarks?: string;
+        };
+        const result = await createBatch(env.DB, admin, clean(body.effective_date), [{
+          productId,
+          caseCents: toCents(body.lpbt_price_case),
+          pcsCents: toCents(body.lpbt_price_pcs),
+        }], clean(body.remarks));
+        return json({ ...result, product: await getCurrentProduct(env.DB, productId) }, 201);
+      }
+
+      // ADMIN: CSV import. Each row becomes a product/current price entry.
+      if (method === "POST" && path === "/api/admin/import") {
+        const admin = requireAdmin(request, env);
+        const body = await request.json() as { rows?: ProductInput[] };
+        if (!Array.isArray(body.rows)) return json({ error: "CSV rows are required" }, 400);
+
+        const summary = { imported: 0, skipped: 0, errors: [] as string[] };
+        for (let index = 0; index < body.rows.length; index++) {
+          const row = body.rows[index];
+          try {
+            const itemCode = clean(row.item_code);
+            const description = clean(row.item_description ?? row.description);
+            const barcode = clean(row.barcode);
+            if (!itemCode || !description) throw new Error("Item code and description are required");
+            if (barcode && !/^\d+$/.test(barcode)) throw new Error("Barcode must contain numbers only");
+
+            let product = await env.DB.prepare(`
+              SELECT id FROM products WHERE item_code = ?
+            `).bind(itemCode).first<{ id: number }>();
+
+            if (!product) {
+              const inserted = await env.DB.prepare(`
+                INSERT INTO products (item_code, barcode, description, grammage, pack_size, brand, category)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+              `).bind(
+                itemCode, barcode || null, description,
+                clean(row.grammage) || null, clean(row.pack_size) || null,
+                clean(row.brand) || null, clean(row.category) || null,
+              ).run();
+              product = { id: Number(inserted.meta.last_row_id) };
+            }
+
+            const effectiveDate = clean(row.effective_date) || new Date().toISOString().slice(0, 10);
+            await createBatch(env.DB, admin, effectiveDate, [{
+              productId: product.id,
+              caseCents: toCents(row.lpbt_price_case),
+              pcsCents: toCents(row.lpbt_price_pcs),
+            }], clean(row.remarks));
+            summary.imported++;
+          } catch (error) {
+            summary.skipped++;
+            summary.errors.push(`Row ${index + 2}: ${error instanceof Error ? error.message : "Invalid row"}`);
+          }
+        }
+        await logActivity(env.DB, admin, "csv_import", "products", null, summary);
+        return json(summary);
+      }
+
+      // ADMIN: CSV export.
+      if (method === "GET" && path === "/api/admin/export") {
+        requireAdmin(request, env);
+        const includeInactive = url.searchParams.get("inactive") === "true";
+        const result = await env.DB.prepare(`
+          SELECT p.item_code, p.barcode, p.description AS item_description,
+            p.grammage, p.pack_size, p.brand, p.category, p.is_active,
+            pb.batch_code AS batch_id, pb.effective_date,
+            pbi.lpbt_case_cents, pbi.lpbt_pcs_cents,
+            pbi.lpat_case_cents, pbi.lpat_pcs_cents, pbi.is_current
+          FROM products p
+          LEFT JOIN price_batch_items pbi ON pbi.product_id = p.id
+          LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
+          ${includeInactive ? "" : "WHERE p.is_active = 1"}
+          ORDER BY p.item_code, pb.effective_date DESC, pb.id DESC
+        `).all<Record<string, any>>();
+
+        const headers = [
+          "item_code", "barcode", "item_description", "grammage", "pack_size",
+          "brand", "category", "is_active", "batch_id", "effective_date",
+          "lpbt_price_case", "lpbt_price_pcs", "lpat_price_case", "lpat_price_pcs", "is_current",
+        ];
+        const escapeCsv = (value: unknown) => {
+          const text = value == null ? "" : String(value);
+          return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+        };
+        const rows = (result.results || []).map((row) => [
+          row.item_code, row.barcode, row.item_description, row.grammage, row.pack_size,
+          row.brand, row.category, row.is_active, row.batch_id, row.effective_date,
+          toPesos(row.lpbt_case_cents), toPesos(row.lpbt_pcs_cents),
+          toPesos(row.lpat_case_cents), toPesos(row.lpat_pcs_cents), row.is_current,
+        ].map(escapeCsv).join(","));
+        return new Response([headers.join(","), ...rows].join("\n"), {
+          headers: {
+            "content-type": "text/csv; charset=utf-8",
+            "content-disposition": 'attachment; filename="products.csv"',
+            "cache-control": "no-store",
+          },
+        });
+      }
+
+      if (path.startsWith("/api/admin/")) {
+        requireAdmin(request, env);
+      }
+      return json({ error: "API endpoint not found" }, 404);
     } catch (error) {
-      const status = (error as { status?: number }).status || 500
-      return json({ error: error instanceof Error ? error.message : 'Internal server error' }, status)
+      const status = (error as { status?: number }).status || 500;
+      return json({ error: error instanceof Error ? error.message : "Internal server error" }, status);
     }
   },
-}
+};

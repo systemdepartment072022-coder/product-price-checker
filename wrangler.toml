@@ -13,5 +13,5 @@ database_name = "product-price-checker-db"
 database_id = "080fb285-b83f-456f-93be-27aff45132e9"
 
 [vars]
-DEV_MODE = "true"
+DEV_MODE = "false"
 ADMIN_EMAILS = "systemdepartment072022@gmail.com"

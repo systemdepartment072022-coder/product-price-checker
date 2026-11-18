@@ -10,11 +10,11 @@ type Product = {
   barcode?: string
   item_description: string
   grammage?: string
-  pack_size?: number
+  pack_size?: string | number
   brand?: string
   category?: string
   is_active?: number
-  date_updated?: string
+  updated_at?: string
   batch_id?: string
   lpbt_price_case?: number
   lpbt_price_pcs?: number
@@ -36,7 +36,8 @@ type Batch = Product & {
 }
 
 const php = new Intl.NumberFormat('en-PH', { style: 'currency', currency: 'PHP' })
-const money = (centavos?: number) => php.format((centavos || 0) / 100)
+// Worker API returns peso amounts (not centavos).
+const money = (pesos?: number) => php.format(pesos || 0)
 const api = async (path: string, options?: RequestInit) => {
   const response = await fetch(path, {
     ...options,
@@ -57,39 +58,26 @@ function highlight(text: string, query: string) {
 const emptyForm = {
   item_code: '', barcode: '', item_description: '', grammage: '', pack_size: '',
   brand: '', category: '', lpbt_price_case: '', lpbt_price_pcs: '',
-  batch_id: '', effective_date: new Date().toISOString().slice(0, 10), remarks: '',
+  effective_date: new Date().toISOString().slice(0, 10), remarks: '',
 }
 
 function CalculatorPanel({ product }: { product: Product }) {
-  const [type, setType] = useState<'percent' | 'fixed'>('percent')
-  const [value, setValue] = useState('')
+  const [discount, setDiscount] = useState('')
   const [caseQty, setCaseQty] = useState('')
   const [pcsQty, setPcsQty] = useState('')
-  const [fixedScope, setFixedScope] = useState<'unit' | 'transaction'>('unit')
-  const n = (x: string) => Number(x || 0)
+  const n = (x: string) => Math.max(0, Number(x || 0))
+  const percent = Math.min(100, n(discount))
   const caseBase = product.lpat_price_case || 0
   const pcsBase = product.lpat_price_pcs || 0
-  let caseDiscount = 0
-  let pcsDiscount = 0
-  if (type === 'percent') {
-    caseDiscount = Math.round(caseBase * n(value) / 100)
-    pcsDiscount = Math.round(pcsBase * n(value) / 100)
-  } else if (fixedScope === 'unit') {
-    caseDiscount = Math.round(n(value) * 100)
-    pcsDiscount = Math.round(n(value) * 100)
-  } else {
-    caseDiscount = Math.round(n(value) * 100)
-    pcsDiscount = 0
-  }
-  const caseNet = Math.max(0, caseBase - caseDiscount)
-  const pcsNet = Math.max(0, pcsBase - pcsDiscount)
+  const caseNet = Math.max(0, caseBase * (1 - percent / 100))
+  const pcsNet = Math.max(0, pcsBase * (1 - percent / 100))
   const caseTotal = caseNet * n(caseQty)
   const pcsTotal = pcsNet * n(pcsQty)
   const grand = caseTotal + pcsTotal
-  const original = (caseBase * n(caseQty)) + (pcsBase * n(pcsQty))
-  const reset = () => { setValue(''); setCaseQty(''); setPcsQty('') }
+  const original = caseBase * n(caseQty) + pcsBase * n(pcsQty)
+  const reset = () => { setDiscount(''); setCaseQty(''); setPcsQty('') }
   const copy = async () => navigator.clipboard.writeText(
-    `Case: ${n(caseQty)} x ${money(caseNet)} = ${money(caseTotal)}\nPcs: ${n(pcsQty)} x ${money(pcsNet)} = ${money(pcsTotal)}\nGrand Total: ${money(grand)}`
+    `Discount: ${percent}%\nCase: ${n(caseQty)} x ${money(caseNet)} = ${money(caseTotal)}\nPcs: ${n(pcsQty)} x ${money(pcsNet)} = ${money(pcsTotal)}\nGrand Total: ${money(grand)}`
   )
 
   return (
@@ -99,23 +87,11 @@ function CalculatorPanel({ product }: { product: Product }) {
         <Calculator size={28} />
       </div>
       <div className="calc-grid">
-        <label>Discount type
-          <select value={type} onChange={(e) => setType(e.target.value as 'percent' | 'fixed')}>
-            <option value="percent">Percentage (%)</option>
-            <option value="fixed">Fixed amount (₱)</option>
-          </select>
+        <label>Discount percentage (%)
+          <div className="input-suffix"><input type="number" min="0" max="100" step="0.01" value={discount} onChange={(e) => setDiscount(e.target.value)} placeholder="0" /><span>%</span></div>
         </label>
-        <label>{type === 'percent' ? 'Discount percentage' : 'Fixed amount'}
-          <div className="input-suffix"><input type="number" min="0" value={value} onChange={(e) => setValue(e.target.value)} placeholder="0" /><span>{type === 'percent' ? '%' : '₱'}</span></div>
-        </label>
-        {type === 'fixed' && <label>Fixed discount scope
-          <select value={fixedScope} onChange={(e) => setFixedScope(e.target.value as 'unit' | 'transaction')}>
-            <option value="unit">Per unit</option>
-            <option value="transaction">Per transaction</option>
-          </select>
-        </label>}
-        <label>Quantity case<input type="number" min="0" value={caseQty} onChange={(e) => setCaseQty(e.target.value)} placeholder="0" /></label>
-        <label>Quantity pcs<input type="number" min="0" value={pcsQty} onChange={(e) => setPcsQty(e.target.value)} placeholder="0" /></label>
+        <label>Quantity case<input type="number" min="0" step="1" value={caseQty} onChange={(e) => setCaseQty(e.target.value)} placeholder="0" /></label>
+        <label>Quantity pcs<input type="number" min="0" step="1" value={pcsQty} onChange={(e) => setPcsQty(e.target.value)} placeholder="0" /></label>
       </div>
       <div className="result-grid">
         <div><span>LPAT case</span><strong>{money(caseBase)}</strong></div>
@@ -213,7 +189,7 @@ function ProductForm({ product, onClose, onSaved }: { product?: Product | null; 
     item_code: product.item_code || '', barcode: product.barcode || '', item_description: product.item_description || '',
     grammage: product.grammage || '', pack_size: String(product.pack_size || ''), brand: product.brand || '',
     category: product.category || '', lpbt_price_case: '', lpbt_price_pcs: '',
-    batch_id: '', effective_date: new Date().toISOString().slice(0, 10), remarks: product.remarks || '',
+    effective_date: new Date().toISOString().slice(0, 10), remarks: product.remarks || '',
   } : emptyForm)
   const [error, setError] = useState('')
   const set = (key: string, value: string) => setForm((old) => ({ ...old, [key]: value }))
@@ -248,7 +224,6 @@ function ProductForm({ product, onClose, onSaved }: { product?: Product | null; 
           <div className="divider" /><div className="form-grid">
             <label>LPBT price case (₱)<input type="number" min="0" step="0.01" value={form.lpbt_price_case} onChange={(e) => set('lpbt_price_case', e.target.value)} /></label>
             <label>LPBT price pcs (₱)<input type="number" min="0" step="0.01" value={form.lpbt_price_pcs} onChange={(e) => set('lpbt_price_pcs', e.target.value)} /></label>
-            <label>Batch ID<input value={form.batch_id} onChange={(e) => set('batch_id', e.target.value)} /></label>
             <label>Effective date<input type="date" value={form.effective_date} onChange={(e) => set('effective_date', e.target.value)} /></label>
           </div>
           <div className="preview-prices"><div><span>LPAT case</span><strong>₱{lpatCase}</strong></div><div><span>LPAT pcs</span><strong>₱{lpatPcs}</strong></div></div>
@@ -260,7 +235,7 @@ function ProductForm({ product, onClose, onSaved }: { product?: Product | null; 
 }
 
 function BatchModal({ product, onClose, onSaved }: { product: Product; onClose: () => void; onSaved: () => void }) {
-  const [form, setForm] = useState({ batch_id: '', lpbt_price_case: '', lpbt_price_pcs: '', effective_date: new Date().toISOString().slice(0, 10), remarks: '' })
+  const [form, setForm] = useState({ lpbt_price_case: '', lpbt_price_pcs: '', effective_date: new Date().toISOString().slice(0, 10), remarks: '' })
   const [error, setError] = useState('')
   const set = (key: string, value: string) => setForm((old) => ({ ...old, [key]: value }))
   const submit = async () => {
@@ -272,10 +247,9 @@ function BatchModal({ product, onClose, onSaved }: { product: Product; onClose: 
     } catch (e) { setError(e instanceof Error ? e.message : 'Unable to save batch') }
   }
   return <div className="modal-backdrop"><div className="modal small">
-    <div className="modal-head"><div><span className="eyebrow">Price batch</span><h2>Add new prices</h2></div><button onClick={onClose}><X /></button></div>
+    <div className="modal-head"><div><span className="eyebrow">Price batch</span><h2>Add new prices</h2><small>Batch ID will be generated automatically.</small></div><button onClick={onClose}><X /></button></div>
     {error && <div className="error">{error}</div>}
     <div className="form-grid">
-      <label>Batch ID<input value={form.batch_id} onChange={(e) => set('batch_id', e.target.value)} /></label>
       <label>Effective date<input type="date" value={form.effective_date} onChange={(e) => set('effective_date', e.target.value)} /></label>
       <label>LPBT case (₱)<input type="number" step="0.01" value={form.lpbt_price_case} onChange={(e) => set('lpbt_price_case', e.target.value)} /></label>
       <label>LPBT pcs (₱)<input type="number" step="0.01" value={form.lpbt_price_pcs} onChange={(e) => set('lpbt_price_pcs', e.target.value)} /></label>
@@ -345,7 +319,7 @@ function AdminPage() {
         <tbody>{loading ? <tr><td colSpan={8} className="loading-row">Loading products...</td></tr> : items.map((p) => (
           <tr key={p.id}><td><strong>{p.item_code}</strong><span>{p.item_description}</span></td><td>{p.brand || '—'}</td><td>{p.batch_id || '—'}</td>
             <td>{p.lpat_price_case ? money(p.lpat_price_case) : '—'}</td><td>{p.lpat_price_pcs ? money(p.lpat_price_pcs) : '—'}</td>
-            <td><span className={`status ${p.is_active ? 'active' : 'inactive'}`}>{p.is_active ? 'Active' : 'Inactive'}</span></td><td>{p.date_updated?.slice(0, 10) || '—'}</td>
+            <td><span className={`status ${p.is_active ? 'active' : 'inactive'}`}>{p.is_active ? 'Active' : 'Inactive'}</span></td><td>{p.updated_at?.slice(0, 10) || '—'}</td>
             <td><div className="row-actions"><button title="Edit" onClick={() => setForm(p)}><Edit3 size={16} /></button><button title="Add batch" onClick={() => setBatch(p)}><Plus size={16} /></button><button title="History" onClick={() => viewHistory(p)}><History size={16} /></button><button title={p.is_active ? 'Deactivate' : 'Activate'} onClick={() => toggleStatus(p)}><Power size={16} /></button></div></td>
           </tr>
         ))}</tbody></table></div>
