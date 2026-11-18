@@ -67,6 +67,48 @@ const api = async (path: string, options?: RequestInit) => {
   return data
 }
 
+type ToastKind = 'success' | 'error' | 'info'
+
+function notify(kind: ToastKind, title: string, message: string) {
+  window.dispatchEvent(new CustomEvent('app-toast', {
+    detail: { kind, title, message },
+  }))
+}
+
+function ToastHost() {
+  const [toasts, setToasts] = useState<Array<{ id: number; kind: ToastKind; title: string; message: string }>>([])
+
+  useEffect(() => {
+    const onToast = (event: Event) => {
+      const detail = (event as CustomEvent<{ kind: ToastKind; title: string; message: string }>).detail
+      const id = Date.now() + Math.random()
+      setToasts((current) => [...current, { id, ...detail }])
+      window.setTimeout(() => {
+        setToasts((current) => current.filter((toast) => toast.id !== id))
+      }, 4500)
+    }
+
+    window.addEventListener('app-toast', onToast)
+    return () => window.removeEventListener('app-toast', onToast)
+  }, [])
+
+  return (
+    <div className="toast-region" aria-live="polite" aria-label="Notifications">
+      {toasts.map((toast) => (
+        <div className={`toast ${toast.kind}`} key={toast.id}>
+          <div className="toast-icon">
+            {toast.kind === 'success' ? <Check size={18} /> : toast.kind === 'error' ? <X size={18} /> : <Package size={18} />}
+          </div>
+          <div>
+            <strong>{toast.title}</strong>
+            <span>{toast.message}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function highlight(text: string, query: string) {
   if (!query) return text
 
@@ -136,9 +178,9 @@ Grand Total: ${money(grand)}
 Savings: ${money(Math.max(0, original - grand))}`
       )
 
-      alert('Calculation copied successfully.')
+      notify('success', 'Calculation copied', 'The result was copied to the clipboard.')
     } catch {
-      alert('Unable to copy. Please check browser clipboard permissions.')
+      notify('error', 'Copy failed', 'Please check browser clipboard permissions.')
     }
   }
 
@@ -472,8 +514,17 @@ function ProductForm({
   const submit = async () => {
     setError('')
 
-    if (!form.item_code.trim() || !form.item_description.trim() || !Number.isInteger(packSize) || packSize <= 0) {
-      setError('Item code, item description, and a positive whole-number pack size are required.')
+    if (!form.item_code.trim() || !form.item_description.trim()) {
+      const message = 'Item code and item description are required.'
+      setError(message)
+      notify('error', 'Missing required fields', message)
+      return
+    }
+
+    if (!Number.isInteger(packSize) || packSize <= 0) {
+      const message = 'Pack size must be a positive whole number.'
+      setError(message)
+      notify('error', 'Invalid pack size', message)
       return
     }
 
@@ -482,7 +533,9 @@ function ProductForm({
       !Number.isFinite(Number(form.lpbt_price_case)) ||
       Number(form.lpbt_price_case) < 0
     )) {
-      setError('Please enter a valid LPBT case price.')
+      const message = 'Please enter a valid LPBT case price.'
+      setError(message)
+      notify('error', 'Invalid price', message)
       return
     }
 
@@ -501,9 +554,13 @@ function ProductForm({
         })
       }
 
+      notify('success', product ? 'Product updated' : 'Product created',
+        product ? 'Product information was saved successfully.' : 'The product and its initial price batch were saved.')
       onSaved()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to save')
+      const message = e instanceof Error ? e.message : 'Unable to save'
+      setError(message)
+      notify('error', 'Save failed', message)
     } finally {
       setSaving(false)
     }
@@ -553,6 +610,7 @@ function ProductForm({
               min="1"
               step="1"
               required
+                aria-invalid={!form.pack_size || packSize <= 0 || !Number.isInteger(packSize)}
               value={form.pack_size}
               onChange={(e) => set('pack_size', e.target.value)}
             />
@@ -623,7 +681,8 @@ function ProductForm({
             Cancel
           </button>
 
-          <button className="btn" onClick={submit} disabled={saving}>
+          <button className="btn" onClick={submit} disabled={saving} aria-busy={saving}>
+            {saving && <span className="spinner" />}
             {saving ? 'Saving...' : product ? 'Save changes' : 'Create product'}
           </button>
         </div>
@@ -667,12 +726,16 @@ function BatchModal({
       !Number.isFinite(Number(form.lpbt_price_case)) ||
       Number(form.lpbt_price_case) < 0
     ) {
-      setError('Please enter a valid LPBT case price.')
+      const message = 'Please enter a valid LPBT case price.'
+      setError(message)
+      notify('error', 'Invalid price', message)
       return
     }
 
     if (!Number.isInteger(packSize) || packSize <= 0) {
-      setError('Set a positive whole-number pack size for this product before adding prices.')
+      const message = 'Set a positive whole-number pack size for this product before adding prices.'
+      setError(message)
+      notify('error', 'Invalid pack size', message)
       return
     }
 
@@ -702,9 +765,12 @@ function BatchModal({
         }),
       })
 
+      notify('success', 'Price batch saved', 'The new price batch was created and is now current.')
       onSaved()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Unable to save batch')
+      const message = e instanceof Error ? e.message : 'Unable to save batch'
+      setError(message)
+      notify('error', 'Batch save failed', message)
     } finally {
       setSaving(false)
     }
@@ -786,7 +852,8 @@ function BatchModal({
             Cancel
           </button>
 
-          <button className="btn" onClick={submit} disabled={saving}>
+          <button className="btn" onClick={submit} disabled={saving} aria-busy={saving}>
+            {saving && <span className="spinner" />}
             {saving ? 'Saving...' : 'Save batch'}
           </button>
         </div>
@@ -818,9 +885,12 @@ function CatalogSection({
         body: JSON.stringify({ type, value }),
       })
       setValue('')
+      notify('success', `${label} added`, `"${value.trim()}" is now available in the dropdown.`)
       await onChanged()
     } catch (e) {
-      setError(e instanceof Error ? e.message : `Unable to add ${label.toLowerCase()}`)
+      const message = e instanceof Error ? e.message : `Unable to add ${label.toLowerCase()}`
+      setError(message)
+      notify('error', `Could not add ${label.toLowerCase()}`, message)
     } finally {
       setSaving(false)
     }
@@ -834,9 +904,12 @@ function CatalogSection({
         method: 'DELETE',
         body: JSON.stringify({ type, value: item }),
       })
+      notify('success', `${label} removed`, `"${item}" was removed from the list.`)
       await onChanged()
     } catch (e) {
-      setError(e instanceof Error ? e.message : `Unable to remove ${label.toLowerCase()}`)
+      const message = e instanceof Error ? e.message : `Unable to remove ${label.toLowerCase()}`
+      setError(message)
+      notify('error', `Could not remove ${label.toLowerCase()}`, message)
     }
   }
 
@@ -851,8 +924,9 @@ function CatalogSection({
           onChange={(e) => setValue(e.target.value)}
           placeholder={`Add ${label.toLowerCase()}`}
         />
-        <button className="btn" onClick={add} disabled={saving || !value.trim()}>
-          <Plus size={16} /> Add
+        <button className="btn" onClick={add} disabled={saving || !value.trim()} aria-busy={saving}>
+          {saving ? <span className="spinner" /> : <Plus size={16} />}
+          {saving ? 'Saving...' : 'Add'}
         </button>
       </div>
       {error && <div className="error">{error}</div>}
@@ -923,6 +997,8 @@ function AdminPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [catalogError, setCatalogError] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   const loadCatalog = async () => {
     const data = await api('/api/admin/lookups')
@@ -983,9 +1059,12 @@ function AdminPage() {
         }),
       })
 
+      notify('success', p.is_active ? 'Product deactivated' : 'Product activated',
+        `${p.item_description} is now ${p.is_active ? 'inactive' : 'active'}.`)
       await load()
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Unable to update product status')
+      const message = e instanceof Error ? e.message : 'Unable to update product status'
+      notify('error', 'Status update failed', message)
     }
   }
 
@@ -998,12 +1077,14 @@ function AdminPage() {
         batches: Array.isArray(batches) ? batches : batches.items || [],
       })
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Unable to load price history')
+      const message = e instanceof Error ? e.message : 'Unable to load price history'
+      notify('error', 'Could not load history', message)
     }
   }
 
   // Import CSV
   const importCsv = async (file: File) => {
+    setImporting(true)
     try {
       const text = await file.text()
 
@@ -1025,18 +1106,26 @@ function AdminPage() {
         body: JSON.stringify({ rows }),
       })
 
-      alert(
-        `Imported ${summary.imported} row(s). Skipped ${summary.skipped}.`
-      )
+      if (summary.skipped) {
+        notify('error', 'Import completed with errors',
+          `Imported ${summary.imported} row(s); skipped ${summary.skipped}.`)
+      } else {
+        notify('success', 'Import completed',
+          `Successfully imported ${summary.imported} row(s).`)
+      }
 
       await load()
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Import failed')
+      const message = e instanceof Error ? e.message : 'Import failed'
+      notify('error', 'Import failed', message)
+    } finally {
+      setImporting(false)
     }
   }
 
   // Export CSV
   const exportCsv = async () => {
+    setExporting(true)
     try {
       const response = await fetch('/api/admin/export?inactive=true')
 
@@ -1054,8 +1143,12 @@ function AdminPage() {
       a.click()
 
       URL.revokeObjectURL(url)
+      notify('success', 'Export downloaded', 'The product CSV export was created successfully.')
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Export failed')
+      const message = e instanceof Error ? e.message : 'Export failed'
+      notify('error', 'Export failed', message)
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -1072,12 +1165,14 @@ function AdminPage() {
             <Tags size={17} /> Manage lists
           </button>
 
-          <label className="btn secondary upload">
-            <Upload size={17} /> Import
+          <label className={`btn secondary upload ${importing ? 'disabled-action' : ''}`} aria-busy={importing}>
+            {importing ? <span className="spinner dark" /> : <Upload size={17} />}
+            {importing ? 'Importing...' : 'Import'}
 
             <input
               type="file"
               accept=".csv,text/csv"
+              disabled={importing}
               onChange={(e) => {
                 const file = e.target.files?.[0]
 
@@ -1089,8 +1184,9 @@ function AdminPage() {
             />
           </label>
 
-          <button className="btn secondary" onClick={exportCsv}>
-            <Download size={17} /> Export
+          <button className="btn secondary" onClick={exportCsv} disabled={exporting} aria-busy={exporting}>
+            {exporting ? <span className="spinner dark" /> : <Download size={17} />}
+            {exporting ? 'Exporting...' : 'Export'}
           </button>
 
           <button className="btn" onClick={() => setForm('new')}>
@@ -1133,7 +1229,7 @@ function AdminPage() {
             {loading ? (
               <tr>
                 <td colSpan={8} className="loading-row">
-                  Loading products...
+                  <span className="table-loader"><span className="spinner dark" /> Loading products...</span>
                 </td>
               </tr>
             ) : (
@@ -1374,6 +1470,8 @@ export default function App() {
       </header>
 
       {page === 'search' ? <SearchPage /> : <AdminPage />}
+
+      <ToastHost />
 
       <footer>
         <span>Product Price Checker</span>
