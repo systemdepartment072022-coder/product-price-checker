@@ -550,7 +550,17 @@ function ProductForm({
       } else {
         await api('/api/admin/products', {
           method: 'POST',
-          body: JSON.stringify(form),
+          body: JSON.stringify({
+            item_code: form.item_code,
+            item_description: form.item_description,
+            grammage: form.grammage,
+            pack_size: form.pack_size,
+            brand: form.brand,
+            category: form.category,
+            lpbt_price_case: String(form.lpbt_price_case),
+            effective_date: form.effective_date,
+            remarks: form.remarks,
+          }),
         })
       }
 
