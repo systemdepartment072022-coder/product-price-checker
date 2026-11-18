@@ -63,6 +63,53 @@ const toPesos = (cents: number | null | undefined) =>
 const lpatCents = (lpbtCents: number) =>
   Math.round((lpbtCents * 112) / 100)
 
+type DatabaseSchema = {
+  priceLayout: "canonical" | "normalized"
+  batchCodeColumn: "batch_id" | "batch_code"
+  activityLayout: "canonical" | "normalized"
+  productDescriptionColumn: "item_description" | "description"
+  productUpdatedColumn: "date_updated" | "updated_at"
+  tableColumns: Map<string, Set<string>>
+}
+
+const schemaCache = new WeakMap<object, Promise<DatabaseSchema>>()
+
+async function getDatabaseSchema(db: D1Database): Promise<DatabaseSchema> {
+  const cached = schemaCache.get(db)
+  if (cached) return cached
+
+  const promise = (async () => {
+    const tableColumns = new Map<string, Set<string>>()
+    for (const table of ["price_batches", "price_batch_items", "activity_logs", "products"]) {
+      try {
+        const result = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>()
+        tableColumns.set(table, new Set((result.results || []).map((column) => column.name)))
+      } catch {
+        tableColumns.set(table, new Set())
+      }
+    }
+
+    const batchColumns = tableColumns.get("price_batches") || new Set()
+    const itemColumns = tableColumns.get("price_batch_items") || new Set()
+    const activityColumns = tableColumns.get("activity_logs") || new Set()
+    const productColumns = tableColumns.get("products") || new Set()
+
+    return {
+      priceLayout: itemColumns.size > 0 ? "normalized" : "canonical",
+      batchCodeColumn: batchColumns.has("batch_code") ? "batch_code" : "batch_id",
+      activityLayout: activityColumns.has("admin_email") ? "normalized" : "canonical",
+      productDescriptionColumn: productColumns.has("description") && !productColumns.has("item_description")
+        ? "description" : "item_description",
+      productUpdatedColumn: productColumns.has("updated_at") && !productColumns.has("date_updated")
+        ? "updated_at" : "date_updated",
+      tableColumns,
+    }
+  })()
+
+  schemaCache.set(db, promise)
+  return promise
+}
+
 function getAdmin(request: Request, env: Env): string | null {
   if (env.DEV_MODE === "true") return "development-admin"
   const email = request.headers
@@ -89,6 +136,7 @@ function productWithPrice(row: Record<string, any> | null) {
   delete product.barcode
   return {
     ...product,
+    item_description: row.item_description ?? row.description,
     lpbt_price_case: toPesos(row.lpbt_price_case),
     lpbt_price_pcs: toPesos(row.lpbt_price_pcs),
     lpat_price_case: toPesos(row.lpat_price_case),
@@ -97,14 +145,37 @@ function productWithPrice(row: Record<string, any> | null) {
 }
 
 async function getCurrentProduct(db: D1Database, id: number) {
-  const row = await db.prepare(`
-    SELECT p.*,
-      b.batch_id, b.effective_date, b.lpbt_price_case, b.lpbt_price_pcs,
-      b.lpat_price_case, b.lpat_price_pcs, b.remarks AS batch_remarks
-    FROM products p
-    LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
-    WHERE p.id = ?
-  `).bind(id).first<Record<string, any>>()
+  const schema = await getDatabaseSchema(db)
+  let row: Record<string, any> | null
+
+  if (schema.priceLayout === "normalized") {
+    row = await db.prepare(`
+      SELECT p.*,
+        pb.${schema.batchCodeColumn} AS batch_id,
+        pb.effective_date,
+        pbi.lpbt_case_cents AS lpbt_price_case,
+        pbi.lpbt_pcs_cents AS lpbt_price_pcs,
+        pbi.lpat_case_cents AS lpat_price_case,
+        pbi.lpat_pcs_cents AS lpat_price_pcs,
+        pb.notes AS batch_remarks
+      FROM products p
+      LEFT JOIN price_batch_items pbi ON pbi.product_id = p.id AND pbi.is_current = 1
+      LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
+      WHERE p.id = ?
+    `).bind(id).first<Record<string, any>>()
+  } else {
+    row = await db.prepare(`
+      SELECT p.*,
+        b.${schema.batchCodeColumn} AS batch_id,
+        b.effective_date,
+        b.lpbt_price_case, b.lpbt_price_pcs,
+        b.lpat_price_case, b.lpat_price_pcs,
+        b.remarks AS batch_remarks
+      FROM products p
+      LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
+      WHERE p.id = ?
+    `).bind(id).first<Record<string, any>>()
+  }
   return productWithPrice(row)
 }
 
@@ -116,17 +187,32 @@ async function logActivity(
   batchId: string | null,
   details: unknown
 ) {
-  await db.prepare(`
-    INSERT INTO activity_logs
-      (product_id, batch_id, action, new_value, modified_by)
-    VALUES (?, ?, ?, ?, ?)
-  `).bind(
-    productId,
-    batchId,
-    action,
-    JSON.stringify(details ?? {}),
-    admin
-  ).run()
+  const schema = await getDatabaseSchema(db)
+  if (schema.activityLayout === "normalized") {
+    await db.prepare(`
+      INSERT INTO activity_logs
+        (admin_email, action, entity_type, entity_id, details)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(
+      admin,
+      action,
+      productId != null ? "product" : "system",
+      productId,
+      JSON.stringify(details ?? {})
+    ).run()
+  } else {
+    await db.prepare(`
+      INSERT INTO activity_logs
+        (product_id, batch_id, action, new_value, modified_by)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(
+      productId,
+      batchId,
+      action,
+      JSON.stringify(details ?? {}),
+      admin
+    ).run()
+  }
 }
 
 function makeBatchCode() {
@@ -156,6 +242,54 @@ async function createBatch(
   const packSize = parsePackSize(product.pack_size)
   const pcsCents = Math.round(caseCents / packSize)
   const batchId = makeBatchCode()
+  const schema = await getDatabaseSchema(db)
+
+  if (schema.priceLayout === "normalized") {
+    const batchInsert = await db.prepare(`
+      INSERT INTO price_batches
+        (${schema.batchCodeColumn}, batch_name, effective_date, notes, created_by)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(batchId, batchId, effectiveDate, remarks || null, admin).run()
+    const batchDbId = Number(batchInsert.meta.last_row_id)
+
+    await db.batch([
+      db.prepare(`
+        UPDATE price_batch_items
+        SET is_current = 0
+        WHERE product_id = ? AND is_current = 1
+      `).bind(productId),
+      db.prepare(`
+        INSERT INTO price_batch_items (
+          batch_id, product_id,
+          lpbt_case_cents, lpbt_pcs_cents,
+          lpat_case_cents, lpat_pcs_cents, is_current
+        )
+        VALUES (?, ?, ?, ?, ?, ?, 1)
+      `).bind(
+        batchDbId,
+        productId,
+        caseCents,
+        pcsCents,
+        lpatCents(caseCents),
+        lpatCents(pcsCents)
+      ),
+      db.prepare(`
+        UPDATE products
+        SET updated_at = datetime('now')
+        WHERE id = ?
+      `).bind(productId),
+    ])
+
+    await logActivity(
+      db,
+      admin,
+      "price_batch_created",
+      productId,
+      batchId,
+      { effective_date: effectiveDate, lpbt_price_case: caseCents }
+    )
+    return batchId
+  }
 
   await db.batch([
     db.prepare(`
@@ -236,9 +370,11 @@ export default {
         const offset = (page - 1) * limit
         if (!q) return json({ items: [], total: 0, page, limit })
         const term = `%${q}%`
+        const schema = await getDatabaseSchema(env.DB)
+        const descriptionColumn = schema.productDescriptionColumn
         const where = `p.is_active = 1 AND (
           LOWER(p.item_code) LIKE ? OR
-          LOWER(p.item_description) LIKE ? OR
+          LOWER(p.${descriptionColumn}) LIKE ? OR
           LOWER(COALESCE(p.grammage,'')) LIKE ? OR
           CAST(p.pack_size AS TEXT) LIKE ? OR
           LOWER(COALESCE(p.brand,'')) LIKE ? OR
@@ -246,18 +382,32 @@ export default {
         const count = await env.DB.prepare(`
           SELECT COUNT(*) AS count FROM products p WHERE ${where}
         `).bind(term, term, term, term, term, term).first<{ count: number }>()
-        const result = await env.DB.prepare(`
-          SELECT p.*,
-            b.batch_id, b.effective_date,
-            b.lpbt_price_case, b.lpbt_price_pcs,
-            b.lpat_price_case, b.lpat_price_pcs
-          FROM products p
-          LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
-          WHERE ${where}
-          ORDER BY p.item_description COLLATE NOCASE
-          LIMIT ? OFFSET ?
-        `).bind(term, term, term, term, term, term, limit, offset)
-          .all<Record<string, any>>()
+        const result = schema.priceLayout === "normalized"
+          ? await env.DB.prepare(`
+              SELECT p.*,
+                pb.${schema.batchCodeColumn} AS batch_id, pb.effective_date,
+                pbi.lpbt_case_cents AS lpbt_price_case,
+                pbi.lpbt_pcs_cents AS lpbt_price_pcs,
+                pbi.lpat_case_cents AS lpat_price_case,
+                pbi.lpat_pcs_cents AS lpat_price_pcs
+              FROM products p
+              LEFT JOIN price_batch_items pbi ON pbi.product_id = p.id AND pbi.is_current = 1
+              LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
+              WHERE ${where}
+              ORDER BY p.${descriptionColumn} COLLATE NOCASE
+              LIMIT ? OFFSET ?
+            `).bind(term, term, term, term, term, term, limit, offset).all<Record<string, any>>()
+          : await env.DB.prepare(`
+              SELECT p.*,
+                b.${schema.batchCodeColumn} AS batch_id, b.effective_date,
+                b.lpbt_price_case, b.lpbt_price_pcs,
+                b.lpat_price_case, b.lpat_price_pcs
+              FROM products p
+              LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
+              WHERE ${where}
+              ORDER BY p.${descriptionColumn} COLLATE NOCASE
+              LIMIT ? OFFSET ?
+            `).bind(term, term, term, term, term, term, limit, offset).all<Record<string, any>>()
         return json({
           items: (result.results || []).map(productWithPrice),
           total: count?.count || 0,
@@ -366,24 +516,42 @@ export default {
         const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") || 20)))
         const offset = (page - 1) * limit
         const term = `%${q}%`
+        const schema = await getDatabaseSchema(env.DB)
+        const descriptionColumn = schema.productDescriptionColumn
+        const updatedColumn = schema.productUpdatedColumn
         const where = q
-          ? `(LOWER(p.item_code) LIKE ? OR LOWER(p.item_description) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ?)`
+          ? `(LOWER(p.item_code) LIKE ? OR LOWER(p.${descriptionColumn}) LIKE ? OR LOWER(COALESCE(p.brand,'')) LIKE ?)`
           : "1=1"
         const binds = q ? [term, term, term] : []
         const count = await env.DB.prepare(`
           SELECT COUNT(*) AS count FROM products p WHERE ${where}
         `).bind(...binds).first<{ count: number }>()
-        const result = await env.DB.prepare(`
-          SELECT p.*,
-            b.batch_id, b.effective_date,
-            b.lpbt_price_case, b.lpbt_price_pcs,
-            b.lpat_price_case, b.lpat_price_pcs
-          FROM products p
-          LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
-          WHERE ${where}
-          ORDER BY p.date_updated DESC
-          LIMIT ? OFFSET ?
-        `).bind(...binds, limit, offset).all<Record<string, any>>()
+        const result = schema.priceLayout === "normalized"
+          ? await env.DB.prepare(`
+              SELECT p.*,
+                pb.${schema.batchCodeColumn} AS batch_id, pb.effective_date,
+                pbi.lpbt_case_cents AS lpbt_price_case,
+                pbi.lpbt_pcs_cents AS lpbt_price_pcs,
+                pbi.lpat_case_cents AS lpat_price_case,
+                pbi.lpat_pcs_cents AS lpat_price_pcs
+              FROM products p
+              LEFT JOIN price_batch_items pbi ON pbi.product_id = p.id AND pbi.is_current = 1
+              LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
+              WHERE ${where}
+              ORDER BY p.${updatedColumn} DESC
+              LIMIT ? OFFSET ?
+            `).bind(...binds, limit, offset).all<Record<string, any>>()
+          : await env.DB.prepare(`
+              SELECT p.*,
+                b.${schema.batchCodeColumn} AS batch_id, b.effective_date,
+                b.lpbt_price_case, b.lpbt_price_pcs,
+                b.lpat_price_case, b.lpat_price_pcs
+              FROM products p
+              LEFT JOIN price_batches b ON b.product_id = p.id AND b.is_current = 1
+              WHERE ${where}
+              ORDER BY p.${updatedColumn} DESC
+              LIMIT ? OFFSET ?
+            `).bind(...binds, limit, offset).all<Record<string, any>>()
         return json({
           items: (result.results || []).map(productWithPrice),
           total: count?.count || 0,
@@ -403,14 +571,30 @@ export default {
 
       if (method === "GET" && historyMatch) {
         const productId = Number(historyMatch[1])
-        const result = await env.DB.prepare(`
-          SELECT id AS batch_db_id, batch_id, effective_date, expiration_date,
-            lpbt_price_case, lpbt_price_pcs, lpat_price_case, lpat_price_pcs,
-            is_current, remarks, created_at
-          FROM price_batches
-          WHERE product_id = ?
-          ORDER BY effective_date DESC, id DESC
-        `).bind(productId).all<Record<string, any>>()
+        const schema = await getDatabaseSchema(env.DB)
+        const result = schema.priceLayout === "normalized"
+          ? await env.DB.prepare(`
+              SELECT pb.id AS batch_db_id, pb.${schema.batchCodeColumn} AS batch_id,
+                pb.effective_date, NULL AS expiration_date,
+                pbi.lpbt_case_cents AS lpbt_price_case,
+                pbi.lpbt_pcs_cents AS lpbt_price_pcs,
+                pbi.lpat_case_cents AS lpat_price_case,
+                pbi.lpat_pcs_cents AS lpat_price_pcs,
+                pbi.is_current, pb.notes AS remarks, pb.created_at
+              FROM price_batch_items pbi
+              JOIN price_batches pb ON pb.id = pbi.batch_id
+              WHERE pbi.product_id = ?
+              ORDER BY pb.effective_date DESC, pb.id DESC
+            `).bind(productId).all<Record<string, any>>()
+          : await env.DB.prepare(`
+              SELECT id AS batch_db_id, ${schema.batchCodeColumn} AS batch_id,
+                effective_date, expiration_date,
+                lpbt_price_case, lpbt_price_pcs, lpat_price_case, lpat_price_pcs,
+                is_current, remarks, created_at
+              FROM price_batches
+              WHERE product_id = ?
+              ORDER BY effective_date DESC, id DESC
+            `).bind(productId).all<Record<string, any>>()
         return json((result.results || []).map((row) => ({
           ...row,
           lpbt_price_case: toPesos(row.lpbt_price_case),
@@ -442,21 +626,43 @@ export default {
         await registerCatalog(env.DB, "brand", brand)
         await registerCatalog(env.DB, "category", category)
 
-        const created = await env.DB.prepare(`
-          INSERT INTO products (
-            item_code, item_description, grammage, pack_size,
-            brand, category, remarks
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).bind(
-          itemCode,
-          description,
-          clean(body.grammage) || null,
-          packSize,
-          brand || null,
-          category || null,
-          clean(body.remarks) || null
-        ).run()
+        const schema = await getDatabaseSchema(env.DB)
+        const descriptionColumn = schema.productDescriptionColumn
+        const normalizedInsert = descriptionColumn === "description"
+
+        let created: D1Result
+        if (normalizedInsert) {
+          created = await env.DB.prepare(`
+            INSERT INTO products (
+              item_code, description, grammage, pack_size,
+              brand, category
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+          `).bind(
+            itemCode,
+            description,
+            clean(body.grammage) || null,
+            packSize,
+            brand || null,
+            category || null
+          ).run()
+        } else {
+          created = await env.DB.prepare(`
+            INSERT INTO products (
+              item_code, item_description, grammage, pack_size,
+              brand, category, remarks
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(
+            itemCode,
+            description,
+            clean(body.grammage) || null,
+            packSize,
+            brand || null,
+            category || null,
+            clean(body.remarks) || null
+          ).run()
+        }
 
         const productId = Number(created.meta.last_row_id)
         await logActivity(env.DB, admin, "product_created", productId, null, body)
@@ -493,36 +699,72 @@ export default {
         await registerCatalog(env.DB, "brand", brand)
         await registerCatalog(env.DB, "category", category)
 
-        const updated = await env.DB.prepare(`
-          UPDATE products
-          SET item_code = ?, item_description = ?, grammage = ?,
-            pack_size = ?, brand = ?, category = ?, remarks = ?,
-            date_updated = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE id = ?
-        `).bind(
-          itemCode,
-          description,
-          clean(body.grammage) || null,
-          packSize,
-          brand || null,
-          category || null,
-          clean(body.remarks) || null,
-          id
-        ).run()
+        const schema = await getDatabaseSchema(env.DB)
+        let updated: D1Result
+        if (schema.productDescriptionColumn === "description") {
+          updated = await env.DB.prepare(`
+            UPDATE products
+            SET item_code = ?, description = ?, grammage = ?,
+              pack_size = ?, brand = ?, category = ?,
+              updated_at = datetime('now')
+            WHERE id = ?
+          `).bind(
+            itemCode,
+            description,
+            clean(body.grammage) || null,
+            packSize,
+            brand || null,
+            category || null,
+            id
+          ).run()
+        } else {
+          updated = await env.DB.prepare(`
+            UPDATE products
+            SET item_code = ?, item_description = ?, grammage = ?,
+              pack_size = ?, brand = ?, category = ?, remarks = ?,
+              date_updated = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+            WHERE id = ?
+          `).bind(
+            itemCode,
+            description,
+            clean(body.grammage) || null,
+            packSize,
+            brand || null,
+            category || null,
+            clean(body.remarks) || null,
+            id
+          ).run()
+        }
         if (!updated.meta.changes) throw badRequest("Product not found")
 
-        const current = await env.DB.prepare(`
-          SELECT id, lpbt_price_case
-          FROM price_batches
-          WHERE product_id = ? AND is_current = 1
-        `).bind(id).first<{ id: number; lpbt_price_case: number }>()
-        if (current) {
-          const pcsCents = Math.round(current.lpbt_price_case / packSize)
-          await env.DB.prepare(`
-            UPDATE price_batches
-            SET lpbt_price_pcs = ?, lpat_price_pcs = ?
-            WHERE id = ?
-          `).bind(pcsCents, lpatCents(pcsCents), current.id).run()
+        if (schema.priceLayout === "normalized") {
+          const current = await env.DB.prepare(`
+            SELECT id, lpbt_case_cents
+            FROM price_batch_items
+            WHERE product_id = ? AND is_current = 1
+          `).bind(id).first<{ id: number; lpbt_case_cents: number }>()
+          if (current) {
+            const pcsCents = Math.round(current.lpbt_case_cents / packSize)
+            await env.DB.prepare(`
+              UPDATE price_batch_items
+              SET lpbt_pcs_cents = ?, lpat_pcs_cents = ?
+              WHERE id = ?
+            `).bind(pcsCents, lpatCents(pcsCents), current.id).run()
+          }
+        } else {
+          const current = await env.DB.prepare(`
+            SELECT id, lpbt_price_case
+            FROM price_batches
+            WHERE product_id = ? AND is_current = 1
+          `).bind(id).first<{ id: number; lpbt_price_case: number }>()
+          if (current) {
+            const pcsCents = Math.round(current.lpbt_price_case / packSize)
+            await env.DB.prepare(`
+              UPDATE price_batches
+              SET lpbt_price_pcs = ?, lpat_price_pcs = ?
+              WHERE id = ?
+            `).bind(pcsCents, lpatCents(pcsCents), current.id).run()
+          }
         }
 
         await logActivity(env.DB, admin, "product_updated", id, null, body)
@@ -535,12 +777,19 @@ export default {
         if (typeof body.is_active !== "boolean") {
           throw badRequest("is_active must be true or false")
         }
-        const updated = await env.DB.prepare(`
-          UPDATE products
-          SET is_active = ?,
-            date_updated = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE id = ?
-        `).bind(body.is_active ? 1 : 0, id).run()
+        const schema = await getDatabaseSchema(env.DB)
+        const updated = schema.productUpdatedColumn === "updated_at"
+          ? await env.DB.prepare(`
+              UPDATE products
+              SET is_active = ?, updated_at = datetime('now')
+              WHERE id = ?
+            `).bind(body.is_active ? 1 : 0, id).run()
+          : await env.DB.prepare(`
+              UPDATE products
+              SET is_active = ?,
+                date_updated = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+              WHERE id = ?
+            `).bind(body.is_active ? 1 : 0, id).run()
         if (!updated.meta.changes) throw badRequest("Product not found")
         await logActivity(env.DB, admin, "product_status_changed", id, null, body)
         return json(await getCurrentProduct(env.DB, id))
@@ -598,21 +847,37 @@ export default {
             `).bind(itemCode).first<{ id: number }>()
 
             if (!product) {
-              const inserted = await env.DB.prepare(`
-                INSERT INTO products (
-                  item_code, item_description, grammage, pack_size,
-                  brand, category, remarks
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-              `).bind(
-                itemCode,
-                description,
-                clean(row.grammage) || null,
-                packSize,
-                brand || null,
-                category || null,
-                clean(row.remarks) || null
-              ).run()
+              const schema = await getDatabaseSchema(env.DB)
+              const inserted = schema.productDescriptionColumn === "description"
+                ? await env.DB.prepare(`
+                    INSERT INTO products (
+                      item_code, description, grammage, pack_size,
+                      brand, category
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                  `).bind(
+                    itemCode,
+                    description,
+                    clean(row.grammage) || null,
+                    packSize,
+                    brand || null,
+                    category || null
+                  ).run()
+                : await env.DB.prepare(`
+                    INSERT INTO products (
+                      item_code, item_description, grammage, pack_size,
+                      brand, category, remarks
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                  `).bind(
+                    itemCode,
+                    description,
+                    clean(row.grammage) || null,
+                    packSize,
+                    brand || null,
+                    category || null,
+                    clean(row.remarks) || null
+                  ).run()
               product = { id: Number(inserted.meta.last_row_id) }
             }
 
@@ -639,17 +904,35 @@ export default {
 
       if (method === "GET" && path === "/api/admin/export") {
         const includeInactive = url.searchParams.get("inactive") === "true"
-        const result = await env.DB.prepare(`
-          SELECT p.item_code, p.item_description, p.grammage, p.pack_size,
-            p.brand, p.category, p.is_active,
-            b.batch_id, b.effective_date,
-            b.lpbt_price_case, b.lpbt_price_pcs,
-            b.lpat_price_case, b.lpat_price_pcs, b.is_current
-          FROM products p
-          LEFT JOIN price_batches b ON b.product_id = p.id
-          ${includeInactive ? "" : "WHERE p.is_active = 1"}
-          ORDER BY p.item_code, b.effective_date DESC, b.id DESC
-        `).all<Record<string, any>>()
+        const schema = await getDatabaseSchema(env.DB)
+        const descriptionColumn = schema.productDescriptionColumn
+        const result = schema.priceLayout === "normalized"
+          ? await env.DB.prepare(`
+              SELECT p.item_code, p.${descriptionColumn} AS item_description,
+                p.grammage, p.pack_size, p.brand, p.category, p.is_active,
+                pb.${schema.batchCodeColumn} AS batch_id, pb.effective_date,
+                pbi.lpbt_case_cents AS lpbt_price_case,
+                pbi.lpbt_pcs_cents AS lpbt_price_pcs,
+                pbi.lpat_case_cents AS lpat_price_case,
+                pbi.lpat_pcs_cents AS lpat_price_pcs,
+                pbi.is_current
+              FROM products p
+              LEFT JOIN price_batch_items pbi ON pbi.product_id = p.id
+              LEFT JOIN price_batches pb ON pb.id = pbi.batch_id
+              ${includeInactive ? "" : "WHERE p.is_active = 1"}
+              ORDER BY p.item_code, pb.effective_date DESC, pb.id DESC
+            `).all<Record<string, any>>()
+          : await env.DB.prepare(`
+              SELECT p.item_code, p.${descriptionColumn} AS item_description,
+                p.grammage, p.pack_size, p.brand, p.category, p.is_active,
+                b.${schema.batchCodeColumn} AS batch_id, b.effective_date,
+                b.lpbt_price_case, b.lpbt_price_pcs,
+                b.lpat_price_case, b.lpat_price_pcs, b.is_current
+              FROM products p
+              LEFT JOIN price_batches b ON b.product_id = p.id
+              ${includeInactive ? "" : "WHERE p.is_active = 1"}
+              ORDER BY p.item_code, b.effective_date DESC, b.id DESC
+            `).all<Record<string, any>>()
 
         const headers = [
           "item_code", "item_description", "grammage", "pack_size",
