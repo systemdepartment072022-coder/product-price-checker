@@ -69,10 +69,35 @@ const api = async (path: string, options?: RequestInit) => {
 
 type ToastKind = 'success' | 'error' | 'info'
 
+type ConfirmOptions = {
+  title: string
+  message: string
+  confirmLabel?: string
+  danger?: boolean
+}
+
+type ConfirmRequest = ConfirmOptions & {
+  resolve: (confirmed: boolean) => void
+}
+
+type ImportStatus =
+  | { phase: 'reading'; fileName: string }
+  | { phase: 'uploading'; fileName: string; rowCount: number }
+  | { phase: 'complete'; fileName: string; imported: number; skipped: number; errors: string[] }
+  | { phase: 'error'; fileName: string; message: string }
+
 function notify(kind: ToastKind, title: string, message: string) {
   window.dispatchEvent(new CustomEvent('app-toast', {
     detail: { kind, title, message },
   }))
+}
+
+function askToConfirm(options: ConfirmOptions) {
+  return new Promise<boolean>((resolve) => {
+    window.dispatchEvent(new CustomEvent('app-confirm', {
+      detail: { ...options, resolve },
+    }))
+  })
 }
 
 function ToastHost() {
@@ -105,6 +130,159 @@ function ToastHost() {
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+function ConfirmHost() {
+  const [request, setRequest] = useState<ConfirmRequest | null>(null)
+  const activeRequest = useRef<ConfirmRequest | null>(null)
+  const queuedRequests = useRef<ConfirmRequest[]>([])
+
+  useEffect(() => {
+    const onConfirm = (event: Event) => {
+      const next = (event as CustomEvent<ConfirmRequest>).detail
+      if (activeRequest.current) {
+        queuedRequests.current.push(next)
+      } else {
+        activeRequest.current = next
+        setRequest(next)
+      }
+    }
+
+    window.addEventListener('app-confirm', onConfirm)
+    return () => window.removeEventListener('app-confirm', onConfirm)
+  }, [])
+
+  if (!request) return null
+
+  const respond = (confirmed: boolean) => {
+    request.resolve(confirmed)
+    const next = queuedRequests.current.shift() || null
+    activeRequest.current = next
+    setRequest(next)
+  }
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => event.target === event.currentTarget && respond(false)}
+    >
+      <section
+        className="modal small confirm-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-title"
+        aria-describedby="confirm-message"
+      >
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">Please confirm</span>
+            <h2 id="confirm-title">{request.title}</h2>
+          </div>
+        </div>
+        <p id="confirm-message" className="confirm-message">{request.message}</p>
+        <div className="modal-actions">
+          <button className="btn secondary" onClick={() => respond(false)}>
+            Cancel
+          </button>
+          <button
+            className={`btn${request.danger ? ' danger' : ''}`}
+            onClick={() => respond(true)}
+            autoFocus
+          >
+            {request.confirmLabel || 'Confirm'}
+          </button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function ImportStatusModal({
+  status,
+  onClose,
+}: {
+  status: ImportStatus
+  onClose: () => void
+}) {
+  const busy = status.phase === 'reading' || status.phase === 'uploading'
+  const title = busy
+    ? 'Importing CSV'
+    : status.phase === 'error'
+      ? 'Import failed'
+      : status.skipped
+        ? 'Import completed with skipped rows'
+        : 'Import complete'
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => !busy && event.target === event.currentTarget && onClose()}
+    >
+      <section
+        className="modal small import-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="import-title"
+        aria-live="polite"
+      >
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">Product import</span>
+            <h2 id="import-title">{title}</h2>
+          </div>
+          <button onClick={onClose} disabled={busy} aria-label="Close import status">
+            <X />
+          </button>
+        </div>
+
+        <p className="import-file">{status.fileName}</p>
+
+        {busy ? (
+          <div className="import-progress">
+            <p>
+              <span className="spinner dark" />
+              {status.phase === 'reading'
+                ? 'Reading the CSV file...'
+                : `Importing ${status.rowCount} row(s). Please keep this window open.`}
+            </p>
+            <div className="progress-track" role="progressbar" aria-label="Import in progress">
+              <div className="progress-bar" />
+            </div>
+          </div>
+        ) : status.phase === 'error' ? (
+          <div className="error">{status.message}</div>
+        ) : (
+          <>
+            <div className="import-summary">
+              <div>
+                <span>Imported</span>
+                <strong>{status.imported}</strong>
+              </div>
+              <div>
+                <span>Skipped</span>
+                <strong>{status.skipped}</strong>
+              </div>
+            </div>
+            {status.errors.length > 0 && (
+              <ul className="import-errors">
+                {status.errors.map((message, index) => (
+                  <li key={`${index}-${message}`}>{message}</li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+
+        <div className="modal-actions">
+          {!busy && (
+            <button className="btn" onClick={onClose}>
+              Close
+            </button>
+          )}
+        </div>
+      </section>
     </div>
   )
 }
@@ -755,11 +933,11 @@ function BatchModal({
       return
     }
 
-    if (
-      !window.confirm(
-        'Replace the current price batch? Previous price history will be preserved.'
-      )
-    ) {
+    if (!await askToConfirm({
+      title: 'Replace the current price batch?',
+      message: 'A new batch will become current. Previous price history will be preserved.',
+      confirmLabel: 'Save new batch',
+    })) {
       return
     }
 
@@ -903,7 +1081,12 @@ function CatalogSection({
   }
 
   const remove = async (item: string) => {
-    if (!window.confirm(`Remove ${label.toLowerCase()} "${item}"?`)) return
+    if (!await askToConfirm({
+      title: `Remove ${label.toLowerCase()}?`,
+      message: `"${item}" will be removed from the available ${label.toLowerCase()} list.`,
+      confirmLabel: 'Remove',
+      danger: true,
+    })) return
     setError('')
     try {
       await api('/api/admin/lookups', {
@@ -1004,6 +1187,7 @@ function AdminPage() {
   const [error, setError] = useState('')
   const [catalogError, setCatalogError] = useState('')
   const [importing, setImporting] = useState(false)
+  const [importStatus, setImportStatus] = useState<ImportStatus | null>(null)
   const [exporting, setExporting] = useState(false)
 
   const loadCatalog = async () => {
@@ -1049,11 +1233,13 @@ function AdminPage() {
 
   // Activate / deactivate product
   const toggleStatus = async (p: Product) => {
-    if (
-      !window.confirm(
-        `${p.is_active ? 'Deactivate' : 'Activate'} ${p.item_description}?`
-      )
-    ) {
+    const action = p.is_active ? 'Deactivate' : 'Activate'
+    if (!await askToConfirm({
+      title: `${action} product?`,
+      message: `${p.item_description} will be ${p.is_active ? 'hidden from' : 'available in'} public search.`,
+      confirmLabel: action,
+      danger: Boolean(p.is_active),
+    })) {
       return
     }
 
@@ -1075,7 +1261,12 @@ function AdminPage() {
   }
 
   const deleteProduct = async (p: Product) => {
-    if (!window.confirm(`Permanently delete ${p.item_description} and its price history?`)) {
+    if (!await askToConfirm({
+      title: 'Delete product permanently?',
+      message: `${p.item_description} and its price history will be permanently deleted.`,
+      confirmLabel: 'Delete permanently',
+      danger: true,
+    })) {
       return
     }
 
@@ -1106,6 +1297,7 @@ function AdminPage() {
   // Import CSV
   const importCsv = async (file: File) => {
     setImporting(true)
+    setImportStatus({ phase: 'reading', fileName: file.name })
     try {
       const text = await file.text()
 
@@ -1122,23 +1314,26 @@ function AdminPage() {
         )
       })
 
+      setImportStatus({ phase: 'uploading', fileName: file.name, rowCount: rows.length })
       const summary = await api('/api/admin/import', {
         method: 'POST',
         body: JSON.stringify({ rows }),
       })
 
-      if (summary.skipped) {
-        notify('error', 'Import completed with errors',
-          `Imported ${summary.imported} row(s); skipped ${summary.skipped}.`)
-      } else {
-        notify('success', 'Import completed',
-          `Successfully imported ${summary.imported} row(s).`)
-      }
+      setImportStatus({
+        phase: 'complete',
+        fileName: file.name,
+        imported: Number(summary.imported) || 0,
+        skipped: Number(summary.skipped) || 0,
+        errors: Array.isArray(summary.errors)
+          ? summary.errors.filter((message: unknown): message is string => typeof message === 'string')
+          : [],
+      })
 
       await load()
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Import failed'
-      notify('error', 'Import failed', message)
+      setImportStatus({ phase: 'error', fileName: file.name, message })
     } finally {
       setImporting(false)
     }
@@ -1429,6 +1624,13 @@ function AdminPage() {
           </div>
         </div>
       )}
+
+      {importStatus && (
+        <ImportStatusModal
+          status={importStatus}
+          onClose={() => setImportStatus(null)}
+        />
+      )}
     </main>
   )
 }
@@ -1495,6 +1697,7 @@ export default function App() {
       {page === 'search' ? <SearchPage /> : <AdminPage />}
 
       <ToastHost />
+      <ConfirmHost />
 
       <footer>
         <span>Product Price Checker</span>

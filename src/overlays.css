@@ -1,0 +1,109 @@
+.toast-region {
+  top: auto;
+  bottom: 20px;
+}
+
+.confirm-message,
+.import-file {
+  color: #667085;
+  line-height: 1.5;
+}
+
+.confirm-modal .btn.danger {
+  background: #dc2626;
+}
+
+.import-progress {
+  display: grid;
+  gap: 12px;
+}
+
+.import-progress p {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #596579;
+}
+
+.progress-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #edf1f6;
+}
+
+.progress-bar {
+  width: 35%;
+  height: 100%;
+  border-radius: inherit;
+  background: #2667d8;
+  animation: import-progress 1.2s ease-in-out infinite alternate;
+}
+
+.import-summary {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.import-summary div {
+  padding: 12px;
+  border-radius: 9px;
+  background: #f8fafc;
+}
+
+.import-summary span,
+.import-summary strong {
+  display: block;
+}
+
+.import-summary span {
+  color: #667085;
+  font-size: 12px;
+}
+
+.import-summary strong {
+  margin-top: 4px;
+  font-size: 20px;
+}
+
+.import-errors {
+  max-height: 200px;
+  overflow: auto;
+  padding: 12px 12px 12px 32px;
+  border-radius: 9px;
+  background: #fff7ed;
+  color: #9a3412;
+  font-size: 13px;
+}
+
+.import-errors li + li {
+  margin-top: 6px;
+}
+
+@keyframes import-progress {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(310%);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 680px) {
+  .toast-region {
+    right: 12px;
+    bottom: 12px;
+  }
+}
