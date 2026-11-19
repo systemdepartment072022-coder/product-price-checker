@@ -459,14 +459,6 @@ function SearchPage() {
                 <span>LPBT pcs</span>
                 <strong>{money(selected.lpbt_price_pcs)}</strong>
               </div>
-              <div className="featured">
-                <span>LPAT case</span>
-                <strong>{money(selected.lpat_price_case)}</strong>
-              </div>
-              <div className="featured">
-                <span>LPAT pcs</span>
-                <strong>{money(selected.lpat_price_pcs)}</strong>
-              </div>
             </div>
           </section>
 
@@ -525,8 +517,6 @@ function ProductForm({
 
   const packSize = Number(form.pack_size)
   const lpbtPcs = perPiecePrice(form.lpbt_price_case, packSize)
-  const lpatCase = (Number(form.lpbt_price_case || 0) * 1.12).toFixed(2)
-  const lpatPcs = (Number(lpbtPcs) * 1.12).toFixed(2)
 
   const submit = async () => {
     setError('')
@@ -693,16 +683,12 @@ function ProductForm({
 
         <div className="preview-prices">
           <div>
+            <span>LPBT per case</span>
+            <strong>₱{Number(form.lpbt_price_case || 0).toFixed(2)}</strong>
+          </div>
+          <div>
             <span>LPBT per piece (automatic)</span>
             <strong>₱{lpbtPcs}</strong>
-          </div>
-          <div>
-            <span>LPAT case</span>
-            <strong>₱{lpatCase}</strong>
-          </div>
-          <div>
-            <span>LPAT pcs</span>
-            <strong>₱{lpatPcs}</strong>
           </div>
         </div>
 
