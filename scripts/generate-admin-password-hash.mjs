@@ -1,7 +1,7 @@
 import { pbkdf2Sync, randomBytes } from 'node:crypto'
 import { stdin, stdout } from 'node:process'
 
-const iterations = 600_000
+const iterations = 100_000
 
 function readHidden(prompt) {
   if (!stdin.isTTY || typeof stdin.setRawMode !== 'function') {
