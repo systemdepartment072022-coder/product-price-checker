@@ -844,22 +844,12 @@ function BatchModal({
 
         <div className="preview-prices">
           <div>
+            <span>LPBT case</span>
+            <strong>₱{Number(form.lpbt_price_case || 0).toFixed(2)}</strong>
+          </div>
+          <div>
             <span>LPBT pcs (automatic)</span>
             <strong>₱{lpbtPcs}</strong>
-          </div>
-
-          <div>
-            <span>LPAT case</span>
-            <strong>
-              ₱{(Number(form.lpbt_price_case || 0) * 1.12).toFixed(2)}
-            </strong>
-          </div>
-
-          <div>
-            <span>LPAT pcs</span>
-            <strong>
-              ₱{(Number(lpbtPcs) * 1.12).toFixed(2)}
-            </strong>
           </div>
         </div>
 
@@ -1248,8 +1238,8 @@ function AdminPage() {
               <th>Item</th>
               <th>Brand</th>
               <th>Batch</th>
-              <th>LPAT case</th>
-              <th>LPAT pcs</th>
+              <th>LPBT case</th>
+              <th>LPBT pcs</th>
               <th>Status</th>
               <th>Updated</th>
               <th>Actions</th>
@@ -1275,14 +1265,14 @@ function AdminPage() {
                   <td>{p.batch_id || '—'}</td>
 
                   <td>
-                    {p.lpat_price_case != null
-                      ? money(p.lpat_price_case)
+                    {p.lpbt_price_case != null
+                      ? money(p.lpbt_price_case)
                       : '—'}
                   </td>
 
                   <td>
-                    {p.lpat_price_pcs != null
-                      ? money(p.lpat_price_pcs)
+                    {p.lpbt_price_pcs != null
+                      ? money(p.lpbt_price_pcs)
                       : '—'}
                   </td>
 
@@ -1425,12 +1415,6 @@ function AdminPage() {
 
                     <dt>LPBT Pcs</dt>
                     <dd>{money(b.lpbt_price_pcs)}</dd>
-
-                    <dt>LPAT Case</dt>
-                    <dd>{money(b.lpat_price_case)}</dd>
-
-                    <dt>LPAT Pcs</dt>
-                    <dd>{money(b.lpat_price_pcs)}</dd>
 
                     <dt>Effective</dt>
                     <dd>{b.effective_date || '—'}</dd>
