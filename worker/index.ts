@@ -85,7 +85,7 @@ async function verifyAdminPassword(password: string, encodedHash: string) {
     extra.length ||
     !Number.isInteger(iterations) ||
     iterations < 100_000 ||
-    iterations > 1_000_000
+    iterations > 100_000
   ) {
     throw serviceUnavailable("Admin password hash is not configured correctly")
   }
