@@ -50,8 +50,9 @@ function toCents(value: unknown): number {
 
 function parsePackSize(value: unknown): number {
   const text = clean(value)
-  const packSize = Number(text)
-  if (!/^[1-9]\d*$/.test(text) || !Number.isSafeInteger(packSize)) {
+  const normalized = text.replace(/\.0+$/, "")
+  const packSize = Number(normalized)
+  if (!/^[1-9]\d*$/.test(normalized) || !Number.isSafeInteger(packSize)) {
     throw badRequest("Pack size must be a positive whole number")
   }
   return packSize
@@ -252,33 +253,38 @@ async function createBatch(
     `).bind(batchId, batchId, effectiveDate, remarks || null, admin).run()
     const batchDbId = Number(batchInsert.meta.last_row_id)
 
-    await db.batch([
-      db.prepare(`
-        UPDATE price_batch_items
-        SET is_current = 0
-        WHERE product_id = ? AND is_current = 1
-      `).bind(productId),
-      db.prepare(`
-        INSERT INTO price_batch_items (
-          batch_id, product_id,
-          lpbt_case_cents, lpbt_pcs_cents,
-          lpat_case_cents, lpat_pcs_cents, is_current
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 1)
-      `).bind(
-        batchDbId,
-        productId,
-        caseCents,
-        pcsCents,
-        lpatCents(caseCents),
-        lpatCents(pcsCents)
-      ),
-      db.prepare(`
-        UPDATE products
-        SET updated_at = datetime('now')
-        WHERE id = ?
-      `).bind(productId),
-    ])
+    try {
+      await db.batch([
+        db.prepare(`
+          UPDATE price_batch_items
+          SET is_current = 0
+          WHERE product_id = ? AND is_current = 1
+        `).bind(productId),
+        db.prepare(`
+          INSERT INTO price_batch_items (
+            batch_id, product_id,
+            lpbt_case_cents, lpbt_pcs_cents,
+            lpat_case_cents, lpat_pcs_cents, is_current
+          )
+          VALUES (?, ?, ?, ?, ?, ?, 1)
+        `).bind(
+          batchDbId,
+          productId,
+          caseCents,
+          pcsCents,
+          lpatCents(caseCents),
+          lpatCents(pcsCents)
+        ),
+        db.prepare(`
+          UPDATE products
+          SET updated_at = datetime('now')
+          WHERE id = ?
+        `).bind(productId),
+      ])
+    } catch (error) {
+      await db.prepare("DELETE FROM price_batches WHERE id = ?").bind(batchDbId).run()
+      throw error
+    }
 
     await logActivity(
       db,
@@ -684,15 +690,27 @@ export default {
         }
 
         const productId = Number(created.meta.last_row_id)
+        let batchId: string
+        try {
+          batchId = await createBatch(
+            env.DB,
+            admin,
+            productId,
+            caseCents,
+            effectiveDate,
+            clean(body.remarks)
+          )
+        } catch (error) {
+          const deletePriceRows = schema.priceLayout === "normalized"
+            ? env.DB.prepare("DELETE FROM price_batch_items WHERE product_id = ?").bind(productId)
+            : env.DB.prepare("DELETE FROM price_batches WHERE product_id = ?").bind(productId)
+          await env.DB.batch([
+            deletePriceRows,
+            env.DB.prepare("DELETE FROM products WHERE id = ?").bind(productId),
+          ])
+          throw error
+        }
         await logActivity(env.DB, admin, "product_created", productId, null, body)
-        const batchId = await createBatch(
-          env.DB,
-          admin,
-          productId,
-          caseCents,
-          effectiveDate,
-          clean(body.remarks)
-        )
         return json({
           product: await getCurrentProduct(env.DB, productId),
           batch_id: batchId,
@@ -708,6 +726,13 @@ export default {
           throw badRequest("Item code and item description are required")
         }
         const packSize = parsePackSize(body.pack_size)
+        const priceCents = body.lpbt_price_case === undefined
+          ? null
+          : toCents(body.lpbt_price_case)
+        const effectiveDate = clean(body.effective_date)
+        if (priceCents !== null && !effectiveDate) {
+          throw badRequest("Effective date is required")
+        }
         const duplicate = await env.DB.prepare(`
           SELECT id FROM products WHERE item_code = ? AND id <> ?
         `).bind(itemCode, id).first()
@@ -719,6 +744,19 @@ export default {
         await registerCatalog(env.DB, "category", category)
 
         const schema = await getDatabaseSchema(env.DB)
+        const currentPrice = priceCents === null
+          ? null
+          : schema.priceLayout === "normalized"
+            ? await env.DB.prepare(`
+                SELECT lpbt_case_cents AS price
+                FROM price_batch_items
+                WHERE product_id = ? AND is_current = 1
+              `).bind(id).first<{ price: number }>()
+            : await env.DB.prepare(`
+                SELECT lpbt_price_case AS price
+                FROM price_batches
+                WHERE product_id = ? AND is_current = 1
+              `).bind(id).first<{ price: number }>()
         let updated: D1Result
         if (schema.productDescriptionColumn === "description") {
           updated = await env.DB.prepare(`
@@ -784,6 +822,17 @@ export default {
               WHERE id = ?
             `).bind(pcsCents, lpatCents(pcsCents), current.id).run()
           }
+        }
+
+        if (priceCents !== null && currentPrice?.price !== priceCents) {
+          await createBatch(
+            env.DB,
+            admin,
+            id,
+            priceCents,
+            effectiveDate,
+            clean(body.remarks)
+          )
         }
 
         await logActivity(env.DB, admin, "product_updated", id, null, body)

@@ -509,7 +509,7 @@ function ProductForm({
           pack_size: String(product.pack_size || ''),
           brand: product.brand || '',
           category: product.category || '',
-          lpbt_price_case: '',
+          lpbt_price_case: product.lpbt_price_case == null ? '' : String(product.lpbt_price_case),
           effective_date: new Date().toISOString().slice(0, 10),
           remarks: product.remarks || '',
         }
@@ -545,11 +545,11 @@ function ProductForm({
       return
     }
 
-    if (!product && (
+    if (
       form.lpbt_price_case === '' ||
       !Number.isFinite(Number(form.lpbt_price_case)) ||
       Number(form.lpbt_price_case) < 0
-    )) {
+    ) {
       const message = 'Please enter a valid LPBT case price.'
       setError(message)
       notify('error', 'Invalid price', message)
@@ -562,7 +562,11 @@ function ProductForm({
       if (product) {
         await api(`/api/admin/products/${product.id}`, {
           method: 'PUT',
-          body: JSON.stringify(form),
+          body: JSON.stringify({
+            ...form,
+            pack_size: String(packSize),
+            lpbt_price_case: String(Number(form.lpbt_price_case)),
+          }),
         })
       } else {
         await api('/api/admin/products', {
@@ -571,7 +575,7 @@ function ProductForm({
             item_code: form.item_code,
             item_description: form.item_description,
             grammage: form.grammage,
-            pack_size: form.pack_size,
+            pack_size: String(packSize),
             brand: form.brand,
             category: form.category,
             lpbt_price_case: String(form.lpbt_price_case),
@@ -598,7 +602,7 @@ function ProductForm({
       className="modal-backdrop"
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
     >
-      <div className="modal">
+      <div className="modal product-modal">
         <div className="modal-head">
           <div>
             <span className="eyebrow">
@@ -660,48 +664,47 @@ function ProductForm({
           </label>
         </div>
 
-        {!product && (
-          <>
-            <div className="divider" />
+        <div className="divider" />
 
-            <div className="form-grid">
-              <label>
-                LPBT price per case (₱)
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={form.lpbt_price_case}
-                  onChange={(e) => set('lpbt_price_case', e.target.value)}
-                />
-              </label>
+        <div className="form-grid">
+          <label>
+            LPBT price per case (₱)
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              required
+              value={form.lpbt_price_case}
+              onChange={(e) => set('lpbt_price_case', e.target.value)}
+            />
+          </label>
 
-              <label>
-                Effective date
-                <input
-                  type="date"
-                  value={form.effective_date}
-                  onChange={(e) => set('effective_date', e.target.value)}
-                />
-              </label>
-            </div>
+          <label>
+            Effective date
+            <input
+              type="date"
+              value={form.effective_date}
+              onChange={(e) => set('effective_date', e.target.value)}
+            />
+          </label>
+        </div>
 
-            <div className="preview-prices">
-              <div>
-                <span>LPBT per piece (automatic)</span>
-                <strong>₱{lpbtPcs}</strong>
-              </div>
-              <div>
-                <span>LPAT case</span>
-                <strong>₱{lpatCase}</strong>
-              </div>
-              <div>
-                <span>LPAT pcs</span>
-                <strong>₱{lpatPcs}</strong>
-              </div>
-            </div>
-          </>
-        )}
+        {product && <p className="form-note">Price changes create a new batch using this effective date; price history is preserved.</p>}
+
+        <div className="preview-prices">
+          <div>
+            <span>LPBT per piece (automatic)</span>
+            <strong>₱{lpbtPcs}</strong>
+          </div>
+          <div>
+            <span>LPAT case</span>
+            <strong>₱{lpatCase}</strong>
+          </div>
+          <div>
+            <span>LPAT pcs</span>
+            <strong>₱{lpatPcs}</strong>
+          </div>
+        </div>
 
         <div className="modal-actions">
           <button className="btn secondary" onClick={onClose} disabled={saving}>
