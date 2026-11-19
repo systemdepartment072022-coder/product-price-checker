@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Calculator, Check, ChevronRight, Download, Edit3, History, Package,
-  Plus, Printer, RefreshCcw, Search, Upload, X, Power, Boxes, Tags,
+  Plus, Printer, RefreshCcw, Search, Upload, X, Power, Boxes, Tags, Trash2,
 } from 'lucide-react'
 
 type Product = {
@@ -305,13 +305,25 @@ function SearchPage() {
   const timer = useRef<number | undefined>(undefined)
 
   useEffect(() => {
+    let active = true
     window.clearTimeout(timer.current)
+
+    if (selected) {
+      setSuggestions([])
+      setOpen(false)
+      setLoading(false)
+      return () => {
+        active = false
+      }
+    }
 
     if (!query.trim()) {
       setSuggestions([])
       setOpen(false)
       setLoading(false)
-      return
+      return () => {
+        active = false
+      }
     }
 
     setLoading(true)
@@ -322,18 +334,23 @@ function SearchPage() {
           `/api/products/search?q=${encodeURIComponent(query.trim())}&limit=8`
         )
 
+        if (!active) return
         setSuggestions(data.items || [])
         setOpen(true)
       } catch {
+        if (!active) return
         setSuggestions([])
         setOpen(true)
       } finally {
-        setLoading(false)
+        if (active) setLoading(false)
       }
     }, 300)
 
-    return () => window.clearTimeout(timer.current)
-  }, [query])
+    return () => {
+      active = false
+      window.clearTimeout(timer.current)
+    }
+  }, [query, selected])
 
   const choose = (product: Product) => {
     setSelected(product)
@@ -1078,6 +1095,21 @@ function AdminPage() {
     }
   }
 
+  const deleteProduct = async (p: Product) => {
+    if (!window.confirm(`Permanently delete ${p.item_description} and its price history?`)) {
+      return
+    }
+
+    try {
+      await api(`/api/admin/products/${p.id}`, { method: 'DELETE' })
+      notify('success', 'Product deleted', `${p.item_description} was permanently deleted.`)
+      await load()
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Unable to delete product'
+      notify('error', 'Delete failed', message)
+    }
+  }
+
   // View product price history
   const viewHistory = async (p: Product) => {
     try {
@@ -1305,6 +1337,14 @@ function AdminPage() {
                         onClick={() => toggleStatus(p)}
                       >
                         <Power size={16} />
+                      </button>
+
+                      <button
+                        title="Delete permanently"
+                        aria-label={`Delete ${p.item_description}`}
+                        onClick={() => deleteProduct(p)}
+                      >
+                        <Trash2 size={16} />
                       </button>
                     </div>
                   </td>

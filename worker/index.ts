@@ -569,6 +569,25 @@ export default {
         return product ? json(product) : json({ error: "Product not found" }, 404)
       }
 
+      if (method === "DELETE" && productMatch) {
+        const id = Number(productMatch[1])
+        const product = await getCurrentProduct(env.DB, id)
+        if (!product) throw badRequest("Product not found")
+
+        const schema = await getDatabaseSchema(env.DB)
+        const deletePriceRows = schema.priceLayout === "normalized"
+          ? env.DB.prepare("DELETE FROM price_batch_items WHERE product_id = ?").bind(id)
+          : env.DB.prepare("DELETE FROM price_batches WHERE product_id = ?").bind(id)
+        const results = await env.DB.batch([
+          deletePriceRows,
+          env.DB.prepare("DELETE FROM products WHERE id = ?").bind(id),
+        ])
+        if (!results[1].meta.changes) throw badRequest("Product not found")
+
+        await logActivity(env.DB, admin, "product_deleted", id, null, product)
+        return json({ id, deleted: true })
+      }
+
       if (method === "GET" && historyMatch) {
         const productId = Number(historyMatch[1])
         const schema = await getDatabaseSchema(env.DB)

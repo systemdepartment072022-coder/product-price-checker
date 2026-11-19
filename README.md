@@ -32,6 +32,7 @@ Open `http://localhost:5173`. Local development uses `DEV_MODE=true` and allows 
 - LPBT per-piece price is calculated from LPBT per-case price divided by pack size, rounded to the nearest centavo.
 - Price revisions create batch history and mark only one batch as current.
 - Deactivated products remain in D1 and disappear from public search.
+- Administrators can permanently delete products and their associated price history.
 - Batch IDs are generated automatically. Brand and category choices are maintained in Product Management.
 
 ## Authentication
