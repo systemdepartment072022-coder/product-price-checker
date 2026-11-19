@@ -806,6 +806,10 @@ export default {
         const count = await env.DB.prepare(`
           SELECT COUNT(*) AS count FROM products p WHERE ${where}
         `).bind(...binds).first<{ count: number }>()
+        const totalProducts = q
+          ? await env.DB.prepare("SELECT COUNT(*) AS count FROM products")
+              .first<{ count: number }>()
+          : count
         const result = schema.priceLayout === "normalized"
           ? await env.DB.prepare(`
               SELECT p.*,
@@ -835,6 +839,7 @@ export default {
         return json({
           items: (result.results || []).map(productWithPrice),
           total: count?.count || 0,
+          totalProducts: totalProducts?.count || 0,
           page,
           limit,
         })

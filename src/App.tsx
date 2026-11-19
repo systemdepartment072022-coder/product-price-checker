@@ -300,9 +300,11 @@ function ImportStatusModal({
 function AdminLoginModal({
   onClose,
   onLoggedIn,
+  sessionCheckError,
 }: {
   onClose: () => void
   onLoggedIn: (email: string) => void
+  sessionCheckError: string
 }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -355,6 +357,12 @@ function AdminLoginModal({
             <X />
           </button>
         </div>
+
+        {sessionCheckError && (
+          <p className="form-note" role="status">
+            We couldn’t verify your existing admin session ({sessionCheckError}). Please sign in again.
+          </p>
+        )}
 
         {error && <div className="error" role="alert">{error}</div>}
 
@@ -1295,6 +1303,7 @@ function CatalogManager({
 
 function AdminPage() {
   const [items, setItems] = useState<Product[]>([])
+  const [totalProducts, setTotalProducts] = useState<number | null>(null)
   const [query, setQuery] = useState('')
   const [form, setForm] = useState<Product | 'new' | null>(null)
   const [batch, setBatch] = useState<Product | null>(null)
@@ -1332,6 +1341,7 @@ function AdminPage() {
       )
 
       setItems(data.items || [])
+      setTotalProducts(typeof data.totalProducts === 'number' ? data.totalProducts : null)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Unable to load products')
     } finally {
@@ -1500,6 +1510,11 @@ function AdminPage() {
         <div>
           <span className="eyebrow">Administration</span>
           <h1>Product management</h1>
+          <span className="product-count" aria-live="polite">
+            {totalProducts === null
+              ? loading ? 'Loading total...' : 'Total count unavailable'
+              : `${totalProducts.toLocaleString()} ${totalProducts === 1 ? 'product' : 'products'}`}
+          </span>
         </div>
 
         <div className="actions">
@@ -1770,6 +1785,7 @@ export default function App() {
   const [menu, setMenu] = useState(false)
   const [adminEmail, setAdminEmail] = useState<string | null>(null)
   const [sessionLoading, setSessionLoading] = useState(true)
+  const [sessionCheckError, setSessionCheckError] = useState('')
   const [loginOpen, setLoginOpen] = useState(false)
 
   useEffect(() => {
@@ -1783,7 +1799,7 @@ export default function App() {
       .catch((e) => {
         if (active) {
           const message = e instanceof Error ? e.message : 'Unable to check admin session'
-          notify('error', 'Admin session unavailable', message)
+          setSessionCheckError(message)
         }
       })
       .finally(() => {
@@ -1892,8 +1908,10 @@ export default function App() {
       {loginOpen && !adminEmail && (
         <AdminLoginModal
           onClose={() => setLoginOpen(false)}
+          sessionCheckError={sessionCheckError}
           onLoggedIn={(email) => {
             setAdminEmail(email)
+            setSessionCheckError('')
             setPage('search')
             setLoginOpen(false)
             notify('success', 'Admin signed in', `Signed in as ${email}.`)
