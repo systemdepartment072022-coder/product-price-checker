@@ -11,7 +11,9 @@ not_found_handling = "single-page-application"
 binding = "DB"
 database_name = "product-price-checker-db"
 database_id = "080fb285-b83f-456f-93be-27aff45132e9"
+migrations_dir = "migrations_admin"
 
 [vars]
 DEV_MODE = "false"
 ADMIN_EMAILS = "systemdepartment072022@gmail.com"
+# Set ADMIN_PASSWORD_HASH and SESSION_SECRET with `wrangler secret put`; never add secrets here.

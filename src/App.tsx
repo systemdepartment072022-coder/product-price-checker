@@ -1,8 +1,9 @@
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
   Calculator, Check, ChevronRight, Download, Edit3, History, Package,
   Plus, Printer, RefreshCcw, Search, Upload, X, Power, Boxes, Tags, Trash2,
+  Eye, EyeOff, LogIn, LogOut,
 } from 'lucide-react'
 
 type Product = {
@@ -52,6 +53,7 @@ const perPiecePrice = (casePrice: string, packSize: number) => {
 const api = async (path: string, options?: RequestInit) => {
   const response = await fetch(path, {
     ...options,
+    credentials: 'same-origin',
     headers: {
       'content-type': 'application/json',
       ...options?.headers,
@@ -61,6 +63,14 @@ const api = async (path: string, options?: RequestInit) => {
   const data = await response.json().catch(() => ({}))
 
   if (!response.ok) {
+    if (
+      (response.status === 401 || response.status === 403) &&
+      path.startsWith('/api/admin/') &&
+      !path.startsWith('/api/admin/login') &&
+      !path.startsWith('/api/admin/session')
+    ) {
+      window.dispatchEvent(new Event('admin-session-ended'))
+    }
     throw new Error(data.error || 'Request failed')
   }
 
@@ -282,6 +292,119 @@ function ImportStatusModal({
             </button>
           )}
         </div>
+      </section>
+    </div>
+  )
+}
+
+function AdminLoginModal({
+  onClose,
+  onLoggedIn,
+}: {
+  onClose: () => void
+  onLoggedIn: (email: string) => void
+}) {
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setError('')
+    if (!email.trim() || !password) {
+      setError('Enter your admin email and password.')
+      return
+    }
+
+    setSaving(true)
+    try {
+      const session = await api('/api/admin/login', {
+        method: 'POST',
+        body: JSON.stringify({ email: email.trim(), password }),
+      })
+      if (!session.authenticated || typeof session.email !== 'string') {
+        throw new Error('Unable to verify the admin session.')
+      }
+      onLoggedIn(session.email)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Unable to sign in.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div
+      className="modal-backdrop"
+      onMouseDown={(event) => event.target === event.currentTarget && !saving && onClose()}
+    >
+      <section
+        className="modal small login-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="admin-login-title"
+      >
+        <div className="modal-head">
+          <div>
+            <span className="eyebrow">Administrator access</span>
+            <h2 id="admin-login-title">Admin login</h2>
+          </div>
+          <button onClick={onClose} disabled={saving} aria-label="Close admin login">
+            <X />
+          </button>
+        </div>
+
+        {error && <div className="error" role="alert">{error}</div>}
+
+        <form className="login-form" onSubmit={submit}>
+          <label>
+            Admin email
+            <input
+              type="email"
+              name="email"
+              autoComplete="username"
+              required
+              maxLength={254}
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+            />
+          </label>
+
+          <label>
+            Password
+            <div className="password-field">
+              <input
+                type={showPassword ? 'text' : 'password'}
+                name="password"
+                autoComplete="current-password"
+                required
+                maxLength={1024}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+              <button
+                type="button"
+                className="password-toggle"
+                onClick={() => setShowPassword((visible) => !visible)}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+              >
+                {showPassword ? <EyeOff size={18} /> : <Eye size={18} />}
+              </button>
+            </div>
+          </label>
+
+          <div className="modal-actions">
+            <button type="button" className="btn secondary" onClick={onClose} disabled={saving}>
+              Cancel
+            </button>
+            <button type="submit" className="btn" disabled={saving} aria-busy={saving}>
+              {saving ? <span className="spinner" /> : <LogIn size={17} />}
+              {saving ? 'Signing in...' : 'Sign in'}
+            </button>
+          </div>
+        </form>
       </section>
     </div>
   )
@@ -1346,6 +1469,9 @@ function AdminPage() {
       const response = await fetch('/api/admin/export?inactive=true')
 
       if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          window.dispatchEvent(new Event('admin-session-ended'))
+        }
         const data = await response.json().catch(() => ({}))
         throw new Error(data.error || 'Export failed')
       }
@@ -1642,6 +1768,56 @@ function AdminPage() {
 export default function App() {
   const [page, setPage] = useState<'search' | 'admin'>('search')
   const [menu, setMenu] = useState(false)
+  const [adminEmail, setAdminEmail] = useState<string | null>(null)
+  const [sessionLoading, setSessionLoading] = useState(true)
+  const [loginOpen, setLoginOpen] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    api('/api/admin/session')
+      .then((session) => {
+        if (active && session.authenticated && typeof session.email === 'string') {
+          setAdminEmail(session.email)
+        }
+      })
+      .catch((e) => {
+        if (active) {
+          const message = e instanceof Error ? e.message : 'Unable to check admin session'
+          notify('error', 'Admin session unavailable', message)
+        }
+      })
+      .finally(() => {
+        if (active) setSessionLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    const onSessionEnded = () => {
+      setAdminEmail(null)
+      setPage('search')
+      notify('error', 'Admin session ended', 'Please sign in again to continue.')
+    }
+
+    window.addEventListener('admin-session-ended', onSessionEnded)
+    return () => window.removeEventListener('admin-session-ended', onSessionEnded)
+  }, [])
+
+  const logout = async () => {
+    try {
+      await api('/api/admin/logout', { method: 'POST' })
+      setAdminEmail(null)
+      setPage('search')
+      setMenu(false)
+      notify('success', 'Signed out', 'Your admin session has ended.')
+    } catch (e) {
+      const message = e instanceof Error ? e.message : 'Unable to sign out'
+      notify('error', 'Sign out failed', message)
+    }
+  }
 
   return (
     <>
@@ -1671,15 +1847,32 @@ export default function App() {
               <Search size={17} /> Price Search
             </button>
 
-            <button
-              className={page === 'admin' ? 'active' : ''}
-              onClick={() => {
-                setPage('admin')
+            {adminEmail ? (
+              <>
+                <button
+                  className={page === 'admin' ? 'active' : ''}
+                  onClick={() => {
+                    setPage('admin')
+                    setMenu(false)
+                  }}
+                >
+                  <Boxes size={17} /> Product Management
+                </button>
+                <span className="admin-account" title={adminEmail}>{adminEmail}</span>
+                <button onClick={logout}>
+                  <LogOut size={17} /> Log out
+                </button>
+              </>
+            ) : sessionLoading ? (
+              <span className="nav-auth-status">Checking session...</span>
+            ) : (
+              <button onClick={() => {
+                setLoginOpen(true)
                 setMenu(false)
-              }}
-            >
-              <Boxes size={17} /> Product Management
-            </button>
+              }}>
+                <LogIn size={17} /> Admin Login
+              </button>
+            )}
           </nav>
 
           <button
@@ -1694,8 +1887,19 @@ export default function App() {
         </div>
       </header>
 
-      {page === 'search' ? <SearchPage /> : <AdminPage />}
+      {page === 'admin' && adminEmail ? <AdminPage /> : <SearchPage />}
 
+      {loginOpen && !adminEmail && (
+        <AdminLoginModal
+          onClose={() => setLoginOpen(false)}
+          onLoggedIn={(email) => {
+            setAdminEmail(email)
+            setPage('search')
+            setLoginOpen(false)
+            notify('success', 'Admin signed in', `Signed in as ${email}.`)
+          }}
+        />
+      )}
       <ToastHost />
       <ConfirmHost />
 

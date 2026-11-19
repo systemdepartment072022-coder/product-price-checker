@@ -24,6 +24,13 @@ npm run dev
 ```
 
 Open `http://localhost:5173`. Local development uses `DEV_MODE=true` and allows administrative API calls.
+Set that override in the ignored `.dev.vars` file before starting `worker:dev`:
+
+```dotenv
+DEV_MODE=true
+```
+
+For local login testing instead, set `DEV_MODE=false`, `ADMIN_EMAILS`, `ADMIN_PASSWORD_HASH`, and `SESSION_SECRET` in `.dev.vars`.
 
 ## Data design
 
@@ -37,7 +44,21 @@ Open `http://localhost:5173`. Local development uses `DEV_MODE=true` and allows 
 
 ## Authentication
 
-Set `DEV_MODE="false"` and configure `ADMIN_EMAILS` with a comma-separated administrator allowlist for production:
+Production admin login uses the Worker secrets `ADMIN_PASSWORD_HASH` and `SESSION_SECRET`. The password hash is PBKDF2-HMAC-SHA-256 (600,000 iterations); the source generator prompts without echoing the password:
+
+```bash
+npm run admin:hash
+npx wrangler secret put ADMIN_PASSWORD_HASH
+npx wrangler secret put SESSION_SECRET
+```
+
+Paste only the generated hash value into the `ADMIN_PASSWORD_HASH` prompt. Generate a random session secret with Node and enter it at the next prompt:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+Set `DEV_MODE="false"` and configure `ADMIN_EMAILS` with a comma-separated administrator allowlist in Cloudflare Worker Variables (the current value is in `wrangler.toml`):
 
 ```toml
 [vars]
@@ -45,7 +66,16 @@ DEV_MODE = "false"
 ADMIN_EMAILS = "admin@example.com,manager@example.com"
 ```
 
-Administrative API endpoints require the Cloudflare Access `CF-Access-Authenticated-User-Email` header and an allowed email. Public search and product detail endpoints remain accessible.
+Apply the authentication migration before deploying:
+
+```bash
+npx wrangler d1 migrations apply product-price-checker-db --remote
+npm run deploy
+```
+
+The password is never stored in the frontend or D1. D1 stores revocable session-token hashes and short-lived hashed login-attempt identifiers. Admin sessions use an HttpOnly, Secure, SameSite=Strict cookie, expire after 30 minutes idle or 12 hours absolute, and are invalidated on logout or when the password hash changes. All admin API routes validate the session; public product search remains available. The Worker serves the frontend and API on the same origin. If you move the frontend to a separate host, proxy it through the Worker or add an exact-origin CORS configuration before deploying there.
+
+The generated password hash is shared by all addresses in `ADMIN_EMAILS`. Use an email-specific credential table if administrators need separate passwords.
 
 ## Cloudflare deployment
 

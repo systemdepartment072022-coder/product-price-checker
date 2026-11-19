@@ -3,6 +3,8 @@ export interface Env {
   ASSETS: Fetcher
   DEV_MODE?: string
   ADMIN_EMAILS?: string
+  ADMIN_PASSWORD_HASH?: string
+  SESSION_SECRET?: string
 }
 
 type ProductInput = {
@@ -18,14 +20,12 @@ type ProductInput = {
   effective_date?: unknown
 }
 
-const json = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    },
-  })
+const json = (data: unknown, status = 200, extraHeaders?: HeadersInit) => {
+  const headers = new Headers(extraHeaders)
+  headers.set("content-type", "application/json; charset=utf-8")
+  headers.set("cache-control", "no-store")
+  return new Response(JSON.stringify(data), { status, headers })
+}
 
 const clean = (value: unknown): string =>
   typeof value === "string"
@@ -36,6 +36,276 @@ const clean = (value: unknown): string =>
 
 const badRequest = (message: string) =>
   Object.assign(new Error(message), { status: 400 })
+
+const unauthorized = (message: string) =>
+  Object.assign(new Error(message), { status: 401 })
+
+const forbidden = (message: string) =>
+  Object.assign(new Error(message), { status: 403 })
+
+const tooManyRequests = (message: string) =>
+  Object.assign(new Error(message), { status: 429 })
+
+const serviceUnavailable = (message: string) =>
+  Object.assign(new Error(message), { status: 503 })
+
+const sessionCookieName = "__Host-ppc_admin"
+const sessionLifetimeSeconds = 12 * 60 * 60
+const idleTimeoutMinutes = 30
+const textEncoder = new TextEncoder()
+
+function getAdminEmails(env: Env) {
+  return (env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean)
+}
+
+function isAllowedAdmin(email: string, env: Env) {
+  return getAdminEmails(env).includes(email.toLowerCase())
+}
+
+function assertSameOrigin(request: Request, env: Env) {
+  if (env.DEV_MODE === "true") return
+  if (request.headers.get("origin") !== new URL(request.url).origin) {
+    throw forbidden("Request origin is not allowed")
+  }
+}
+
+function decodeBase64(value: string) {
+  const decoded = atob(value)
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
+}
+
+async function verifyAdminPassword(password: string, encodedHash: string) {
+  const [algorithm, iterationText, saltText, expectedText, ...extra] = encodedHash.split("$")
+  const iterations = Number(iterationText)
+  if (
+    algorithm !== "pbkdf2_sha256" ||
+    extra.length ||
+    !Number.isInteger(iterations) ||
+    iterations < 100_000 ||
+    iterations > 1_000_000
+  ) {
+    throw serviceUnavailable("Admin password hash is not configured correctly")
+  }
+
+  let salt: Uint8Array
+  let expected: Uint8Array
+  try {
+    salt = decodeBase64(saltText)
+    expected = decodeBase64(expectedText)
+  } catch {
+    throw serviceUnavailable("Admin password hash is not configured correctly")
+  }
+  if (salt.length < 16 || expected.length !== 32) {
+    throw serviceUnavailable("Admin password hash is not configured correctly")
+  }
+
+  const passwordKey = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  )
+  const derived = new Uint8Array(await crypto.subtle.deriveBits({
+    name: "PBKDF2",
+    salt,
+    iterations,
+    hash: "SHA-256",
+  }, passwordKey, 256))
+
+  let difference = 0
+  for (let index = 0; index < derived.length; index++) {
+    difference |= derived[index] ^ expected[index]
+  }
+  return difference === 0
+}
+
+async function hmacHex(value: string, secret: string) {
+  if (secret.length < 32) {
+    throw serviceUnavailable("Session secret is not configured correctly")
+  }
+  const key = await crypto.subtle.importKey(
+    "raw",
+    textEncoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  )
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, textEncoder.encode(value)))
+  return Array.from(signature, (byte) => byte.toString(16).padStart(2, "0")).join("")
+}
+
+function base64Url(bytes: Uint8Array) {
+  let binary = ""
+  for (const byte of bytes) binary += String.fromCharCode(byte)
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "")
+}
+
+function getSessionToken(request: Request) {
+  const cookieHeader = request.headers.get("cookie") || ""
+  for (const cookie of cookieHeader.split(";")) {
+    const [name, ...parts] = cookie.trim().split("=")
+    if (name === sessionCookieName) return parts.join("=") || null
+  }
+  return null
+}
+
+function sessionCookie(token: string) {
+  return `${sessionCookieName}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${sessionLifetimeSeconds}`
+}
+
+function clearSessionCookie() {
+  return `${sessionCookieName}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`
+}
+
+async function getAdminSession(request: Request, env: Env) {
+  if (env.DEV_MODE === "true") {
+    return { email: "development-admin", tokenHash: null as string | null }
+  }
+
+  const token = getSessionToken(request)
+  if (!token) return null
+  if (!env.SESSION_SECRET || !env.ADMIN_PASSWORD_HASH) {
+    throw serviceUnavailable("Admin authentication is not configured")
+  }
+
+  const tokenHash = await hmacHex(token, env.SESSION_SECRET)
+  const credentialFingerprint = await hmacHex(env.ADMIN_PASSWORD_HASH, env.SESSION_SECRET)
+  const session = await env.DB.prepare(`
+    SELECT admin_email
+    FROM admin_sessions
+    WHERE token_hash = ?
+      AND credential_fingerprint = ?
+      AND expires_at > datetime('now')
+      AND last_seen_at > datetime('now', ?)
+  `).bind(
+    tokenHash,
+    credentialFingerprint,
+    `-${idleTimeoutMinutes} minutes`
+  ).first<{ admin_email: string }>()
+
+  if (!session) {
+    await env.DB.prepare("DELETE FROM admin_sessions WHERE token_hash = ?").bind(tokenHash).run()
+    return null
+  }
+
+  await env.DB.prepare(`
+    UPDATE admin_sessions
+    SET last_seen_at = datetime('now')
+    WHERE token_hash = ?
+  `).bind(tokenHash).run()
+
+  return { email: session.admin_email, tokenHash }
+}
+
+async function requireAdmin(request: Request, env: Env): Promise<string> {
+  const session = await getAdminSession(request, env)
+  if (!session) throw unauthorized("Administrator login required")
+  if (session.email !== "development-admin" && !isAllowedAdmin(session.email, env)) {
+    throw forbidden("Administrator access is not allowed")
+  }
+  return session.email
+}
+
+async function enforceLoginRateLimit(db: D1Database, emailKey: string, ipKey: string) {
+  const attempts = await db.prepare(`
+    SELECT
+      SUM(CASE WHEN email_key = ? THEN 1 ELSE 0 END) AS email_attempts,
+      SUM(CASE WHEN ip_key = ? THEN 1 ELSE 0 END) AS ip_attempts
+    FROM admin_login_attempts
+    WHERE attempted_at >= datetime('now', '-15 minutes')
+  `).bind(emailKey, ipKey).first<{
+    email_attempts: number | null
+    ip_attempts: number | null
+  }>()
+
+  if ((attempts?.email_attempts || 0) >= 5 || (attempts?.ip_attempts || 0) >= 30) {
+    throw tooManyRequests("Too many login attempts. Please try again later.")
+  }
+}
+
+async function loginAdmin(request: Request, env: Env) {
+  assertSameOrigin(request, env)
+  if (env.DEV_MODE === "true") {
+    return json({ authenticated: true, email: "development-admin" })
+  }
+  if (!env.ADMIN_PASSWORD_HASH || !env.SESSION_SECRET || !getAdminEmails(env).length) {
+    throw serviceUnavailable("Admin authentication is not configured")
+  }
+
+  let bodyValue: unknown
+  try {
+    bodyValue = await request.json()
+  } catch {
+    throw badRequest("Request body must be valid JSON")
+  }
+  if (!bodyValue || typeof bodyValue !== "object" || Array.isArray(bodyValue)) {
+    throw badRequest("Request body must be a JSON object")
+  }
+  const body = bodyValue as { email?: unknown; password?: unknown }
+
+  const email = clean(body.email).toLowerCase()
+  const password = typeof body.password === "string" ? body.password : ""
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !password || password.length > 1024) {
+    throw badRequest("Enter a valid email address and password")
+  }
+
+  const ip = request.headers.get("cf-connecting-ip") || "unknown"
+  const emailKey = await hmacHex(email, env.SESSION_SECRET)
+  const ipKey = await hmacHex(ip, env.SESSION_SECRET)
+  await env.DB.prepare(`
+    DELETE FROM admin_login_attempts
+    WHERE attempted_at < datetime('now', '-1 day')
+  `).run()
+  await enforceLoginRateLimit(env.DB, emailKey, ipKey)
+
+  const passwordMatches = await verifyAdminPassword(password, env.ADMIN_PASSWORD_HASH)
+  if (!isAllowedAdmin(email, env) || !passwordMatches) {
+    await env.DB.prepare(`
+      INSERT INTO admin_login_attempts (email_key, ip_key)
+      VALUES (?, ?)
+    `).bind(emailKey, ipKey).run()
+    throw unauthorized("Invalid email or password")
+  }
+
+  const token = base64Url(crypto.getRandomValues(new Uint8Array(32)))
+  const tokenHash = await hmacHex(token, env.SESSION_SECRET)
+  const credentialFingerprint = await hmacHex(env.ADMIN_PASSWORD_HASH, env.SESSION_SECRET)
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM admin_sessions WHERE expires_at <= datetime('now')"),
+    env.DB.prepare(`
+      DELETE FROM admin_login_attempts
+      WHERE email_key = ? OR ip_key = ?
+    `).bind(emailKey, ipKey),
+    env.DB.prepare(`
+      INSERT INTO admin_sessions (token_hash, admin_email, credential_fingerprint, expires_at)
+      VALUES (?, ?, ?, datetime('now', '+12 hours'))
+    `).bind(tokenHash, email, credentialFingerprint),
+  ])
+
+  return json(
+    { authenticated: true, email },
+    200,
+    { "set-cookie": sessionCookie(token) }
+  )
+}
+
+async function logoutAdmin(request: Request, env: Env) {
+  assertSameOrigin(request, env)
+  const token = getSessionToken(request)
+  if (token && env.SESSION_SECRET) {
+    const tokenHash = await hmacHex(token, env.SESSION_SECRET)
+    await env.DB.prepare("DELETE FROM admin_sessions WHERE token_hash = ?").bind(tokenHash).run()
+  }
+  return json(
+    { authenticated: false },
+    200,
+    { "set-cookie": clearSessionCookie() }
+  )
+}
 
 function toCents(value: unknown): number {
   const text = clean(value)
@@ -109,26 +379,6 @@ async function getDatabaseSchema(db: D1Database): Promise<DatabaseSchema> {
 
   schemaCache.set(db, promise)
   return promise
-}
-
-function getAdmin(request: Request, env: Env): string | null {
-  if (env.DEV_MODE === "true") return "development-admin"
-  const email = request.headers
-    .get("cf-access-authenticated-user-email")
-    ?.trim()
-    .toLowerCase()
-  const allowed = (env.ADMIN_EMAILS || "")
-    .split(",")
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean)
-  if (!email || !allowed.includes(email)) return null
-  return email
-}
-
-function requireAdmin(request: Request, env: Env): string {
-  const admin = getAdmin(request, env)
-  if (!admin) throw Object.assign(new Error("Administrator access required"), { status: 403 })
-  return admin
 }
 
 function productWithPrice(row: Record<string, any> | null) {
@@ -369,6 +619,29 @@ export default {
     try {
       if (!path.startsWith("/api/")) return env.ASSETS.fetch(request)
 
+      if (method === "POST" && path === "/api/admin/login") {
+        return await loginAdmin(request, env)
+      }
+
+      if (method === "POST" && path === "/api/admin/logout") {
+        return await logoutAdmin(request, env)
+      }
+
+      if (method === "GET" && path === "/api/admin/session") {
+        const session = await getAdminSession(request, env)
+        if (!session) {
+          return json({ authenticated: false }, 200, { "set-cookie": clearSessionCookie() })
+        }
+        if (session.email !== "development-admin" && !isAllowedAdmin(session.email, env)) {
+          return json(
+            { authenticated: false, error: "Administrator access is not allowed" },
+            403,
+            { "set-cookie": clearSessionCookie() }
+          )
+        }
+        return json({ authenticated: true, email: session.email })
+      }
+
       if (method === "GET" && path === "/api/products/search") {
         const q = clean(url.searchParams.get("q")).toLowerCase()
         const page = Math.max(1, Number(url.searchParams.get("page") || 1))
@@ -426,7 +699,8 @@ export default {
         return json({ error: "API endpoint not found" }, 404)
       }
 
-      const admin = requireAdmin(request, env)
+      const admin = await requireAdmin(request, env)
+      if (method !== "GET" && method !== "HEAD") assertSameOrigin(request, env)
 
       if (method === "GET" && path === "/api/admin/lookups") {
         try {
